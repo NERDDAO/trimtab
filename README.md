@@ -1,4 +1,4 @@
-# SmartGrammar
+# TrimTab
 
 Context-aware grammar generation with cascading embedding search.
 
@@ -7,16 +7,16 @@ Combines Tracery-style grammars with embedding-based selection. Grammar rules de
 ## Install
 
 ```bash
-pip install smartgrammar
+pip install trimtab
 ```
 
 ## Quick Start
 
 ```python
-from smartgrammar import SmartGrammar
+from trimtab import TrimTab
 
 # Load a grammar and index it
-sg = SmartGrammar.from_file("narration.json")
+sg = TrimTab.from_file("narration.json")
 sg.index()
 
 # Generate with context — embedding selects the best expansion at each level
@@ -87,7 +87,7 @@ Template structure: what rule applies, what pattern to follow, what the user pre
 ```
 
 ```python
-sg = SmartGrammar.from_file("dev_memory.json")
+sg = TrimTab.from_file("dev_memory.json")
 sg.index()
 
 sg.generate(context="debugging WebSocket connection drops")
@@ -130,7 +130,7 @@ Template structure: where things stand, what's in the way, what to do next.
 ```
 
 ```python
-sg = SmartGrammar.from_file("project.json")
+sg = TrimTab.from_file("project.json")
 sg.index()
 
 sg.generate(context="payment processing, what's the state of Stripe")
@@ -160,7 +160,7 @@ Template structure: what you know, what connects to it, what's still unknown.
     "HDBSCAN clustering + embeddings is essentially unsupervised topic modeling",
     "Cascading context in grammar expansion mirrors beam search decoding",
     "N-gram extraction from LLM output is a form of knowledge distillation",
-    "Tracery grammars are context-free — SmartGrammar adds context-sensitivity via embeddings"
+    "Tracery grammars are context-free — TrimTab adds context-sensitivity via embeddings"
   ],
   "questions": [
     "Can cascading embedding search approximate attention without quadratic cost?",
@@ -173,7 +173,7 @@ Template structure: what you know, what connects to it, what's still unknown.
 ```
 
 ```python
-sg = SmartGrammar.from_file("research.json")
+sg = TrimTab.from_file("research.json")
 sg.index()
 
 sg.generate(context="using embeddings to cluster text without labeled data")
@@ -189,7 +189,7 @@ The three slots work as a learning scaffold: here's what you know, here's how it
 Don't have a grammar? Build one from a corpus of text:
 
 ```python
-sg = SmartGrammar.build_from_corpus(texts=[
+sg = TrimTab.build_from_corpus(texts=[
     "The server crashed at 3am due to memory leak in the cache layer",
     "Database connection pool exhausted during peak traffic",
     "JWT validation failing silently — tokens expired but no error logged",
@@ -215,16 +215,16 @@ Combined with n-gram extraction from ongoing work, the grammar becomes a distill
 
 ```bash
 # Index a grammar for embedding search
-smartgrammar index grammar.json
+trimtab index grammar.json
 
 # Generate with context
-smartgrammar generate grammar.sg --context "dark crypt" --temperature 0.3
+trimtab generate grammar.sg --context "dark crypt" --temperature 0.3
 
 # Build grammar from text corpus
-smartgrammar build --input corpus.txt --output grammar.json
+trimtab build --input corpus.txt --output grammar.json
 
 # Add entry to a rule
-smartgrammar add grammar.sg sound "Bones crunch underfoot"
+trimtab add grammar.sg sound "Bones crunch underfoot"
 ```
 
 ## Embedder
@@ -232,9 +232,9 @@ smartgrammar add grammar.sg sound "Bones crunch underfoot"
 Ships with `sentence-transformers/all-MiniLM-L6-v2` (~80MB, works offline). Auto-upgrades to Ollama if running locally for better quality.
 
 ```python
-from smartgrammar import OllamaEmbedder, SmartGrammar
+from trimtab import OllamaEmbedder, TrimTab
 
-sg = SmartGrammar.from_file("grammar.json", embedder=OllamaEmbedder(model="nomic-embed-text"))
+sg = TrimTab.from_file("grammar.json", embedder=OllamaEmbedder(model="nomic-embed-text"))
 ```
 
 ## License

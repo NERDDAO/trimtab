@@ -2,7 +2,7 @@
 import json
 import pytest
 import numpy as np
-from smartgrammar import SmartGrammar, Grammar, GrammarIndex, Generator
+from trimtab import SmartGrammar, Grammar, GrammarIndex, Generator
 
 
 class FakeEmbedder:

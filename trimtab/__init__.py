@@ -1,10 +1,10 @@
-"""SmartGrammar — Context-aware grammar generation with cascading embedding search."""
+"""TrimTab — Context-aware grammar generation with cascading embedding search."""
 
-from smartgrammar.grammar import Grammar
-from smartgrammar.embedder import Embedder, MiniLMEmbedder, OllamaEmbedder, get_default_embedder
-from smartgrammar.index import GrammarIndex
-from smartgrammar.generator import Generator
-from smartgrammar.builder import build_grammar, extract_ngrams, cluster_ngrams
+from trimtab.grammar import Grammar
+from trimtab.embedder import Embedder, MiniLMEmbedder, OllamaEmbedder, get_default_embedder
+from trimtab.index import GrammarIndex
+from trimtab.generator import Generator
+from trimtab.builder import build_grammar, extract_ngrams, cluster_ngrams
 
 __version__ = "0.1.0"
 

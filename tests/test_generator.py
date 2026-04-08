@@ -1,9 +1,9 @@
 """Tests for cascading context-aware generation."""
 import pytest
 import numpy as np
-from smartgrammar.grammar import Grammar
-from smartgrammar.index import GrammarIndex
-from smartgrammar.generator import Generator
+from trimtab.grammar import Grammar
+from trimtab.index import GrammarIndex
+from trimtab.generator import Generator
 
 
 class FakeEmbedder:

@@ -7,8 +7,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from smartgrammar.grammar import Grammar
-from smartgrammar.embedder import Embedder
+from trimtab.grammar import Grammar
+from trimtab.embedder import Embedder
 
 logger = logging.getLogger(__name__)
 

@@ -7,8 +7,8 @@ from pathlib import Path
 import faiss
 import numpy as np
 
-from smartgrammar.embedder import Embedder
-from smartgrammar.grammar import Grammar
+from trimtab.embedder import Embedder
+from trimtab.grammar import Grammar
 
 logger = logging.getLogger(__name__)
 

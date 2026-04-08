@@ -1,14 +1,14 @@
-"""CLI for SmartGrammar: build, index, generate."""
+"""CLI for TrimTab: build, index, generate."""
 
 import argparse
 import json
 import sys
 
-from smartgrammar.grammar import Grammar
-from smartgrammar.embedder import get_default_embedder
-from smartgrammar.index import GrammarIndex
-from smartgrammar.generator import Generator
-from smartgrammar.builder import build_grammar
+from trimtab.grammar import Grammar
+from trimtab.embedder import get_default_embedder
+from trimtab.index import GrammarIndex
+from trimtab.generator import Generator
+from trimtab.builder import build_grammar
 
 
 def cmd_build(args):
@@ -55,7 +55,7 @@ def cmd_add(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="smartgrammar", description="Context-aware grammar generation")
+    parser = argparse.ArgumentParser(prog="trimtab", description="Context-aware grammar generation")
     sub = parser.add_subparsers(dest="command")
 
     # build

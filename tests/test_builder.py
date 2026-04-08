@@ -1,6 +1,6 @@
 """Tests for corpus-to-grammar building."""
 import pytest
-from smartgrammar.builder import extract_ngrams, NGram
+from trimtab.builder import extract_ngrams, NGram
 
 
 def test_extract_ngrams_basic():

@@ -1,8 +1,8 @@
 """Tests for FAISS indexing."""
 import pytest
 import numpy as np
-from smartgrammar.grammar import Grammar
-from smartgrammar.index import GrammarIndex
+from trimtab.grammar import Grammar
+from trimtab.index import GrammarIndex
 
 
 class FakeEmbedder:

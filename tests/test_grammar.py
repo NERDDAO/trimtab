@@ -2,7 +2,7 @@
 import json
 import pytest
 from pathlib import Path
-from smartgrammar.grammar import Grammar
+from trimtab.grammar import Grammar
 
 
 @pytest.fixture
