@@ -75,3 +75,13 @@ def test_multiple_grammars(mem_db, fake_embedder):
     text_b = sg2.generate(context="test", temperature=0.0, seed=42)
     assert text_a in ["alpha", "beta"]
     assert text_b in ["gamma", "delta"]
+
+
+def test_smartgrammar_add_with_id(mem_db, fake_embedder):
+    sg = SmartGrammar(mem_db, "test", embedder=fake_embedder)
+    sg.load_grammar({"origin": ["#place#"], "place": ["The Threshold"]})
+    sg.add("place", "The Dark Crypt", id="entity-uuid-123")
+
+    results = mem_db.query("test", "place", fake_embedder.embed(["dark crypt"])[0], top_k=2)
+    ids = [r[2] for r in results]
+    assert "entity-uuid-123" in ids

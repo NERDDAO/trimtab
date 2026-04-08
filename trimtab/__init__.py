@@ -93,10 +93,17 @@ class SmartGrammar:
             no_match_text=no_match_text,
         )
 
-    def add(self, rule: str, expansion: str) -> None:
-        """Add a new expansion to a rule (auto-embeds and writes to DB)."""
+    def add(self, rule: str, expansion: str, id: str | None = None) -> None:
+        """Add a new expansion to a rule (auto-embeds and writes to DB).
+
+        Args:
+            rule: Rule name within this grammar.
+            expansion: The expansion text.
+            id: Optional custom Expansion id (e.g., a KG entity UUID).
+                If None, an internal id is auto-generated.
+        """
         vec = self._embedder.embed([expansion])[0]
-        self._db.add_expansion(self._name, rule, expansion, vec)
+        self._db.add_expansion(self._name, rule, expansion, vec, id=id)
 
     def export(self) -> Grammar:
         """Export the grammar from the DB as a Grammar object."""

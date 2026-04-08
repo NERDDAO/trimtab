@@ -50,8 +50,12 @@ def cmd_add(args):
     db = _get_db(args)
     embedder = get_default_embedder()
     vec = embedder.embed([args.value])[0]
-    db.add_expansion(args.grammar, args.rule, args.value, vec)
-    print(f"Added '{args.value}' to {args.grammar}:{args.rule}")
+    custom_id = getattr(args, "id", None) or None
+    db.add_expansion(args.grammar, args.rule, args.value, vec, id=custom_id)
+    msg = f"Added '{args.value}' to {args.grammar}:{args.rule}"
+    if custom_id:
+        msg += f" (id={custom_id})"
+    print(msg)
 
 
 def cmd_build(args):
@@ -124,6 +128,7 @@ def main():
     p.add_argument("grammar", help="Grammar name in DB")
     p.add_argument("rule", help="Rule name")
     p.add_argument("value", help="Expansion text to add")
+    p.add_argument("--id", default=None, help="Custom Expansion id (e.g., KG entity UUID)")
 
     # build
     p = sub.add_parser("build", help="Build grammar from corpus")
