@@ -265,6 +265,12 @@ class TrimTabDB:
             )
             rows = result.get_all()
         except Exception:
+            rows = []
+
+        # Fall back to brute force if HNSW returned nothing.
+        # New nodes added after _ensure_hnsw_index() may not be indexed yet,
+        # so empty HNSW results don't necessarily mean no matching data.
+        if not rows:
             rows = self._brute_force_query(rule_id, vector, top_k)
 
         results = []
