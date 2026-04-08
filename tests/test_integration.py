@@ -1,41 +1,19 @@
-"""Integration test: full pipeline with fake embedder."""
+"""Integration test: full pipeline with LadybugDB."""
+
 import json
 import pytest
-import numpy as np
-from trimtab import SmartGrammar, Grammar, GrammarIndex, Generator
+from trimtab import SmartGrammar
+from trimtab.db import TrimTabDB
 
 
-class FakeEmbedder:
-    def __init__(self, dim=8):
-        self._dim = dim
-
-    def embed(self, texts: list[str]) -> np.ndarray:
-        vecs = []
-        for t in texts:
-            np.random.seed(hash(t) % (2**31))
-            vecs.append(np.random.randn(self._dim).astype(np.float32))
-        arr = np.array(vecs)
-        norms = np.linalg.norm(arr, axis=1, keepdims=True)
-        return arr / (norms + 1e-8)
-
-    @property
-    def dimension(self):
-        return self._dim
-
-
-def test_full_pipeline_grammar_first(tmp_path):
-    # Create grammar file
+def test_full_pipeline(mem_db, fake_embedder):
     rules = {
         "origin": ["#sound#. #atmosphere#."],
         "sound": ["A drip", "Wind howls", "Chains rattle"],
         "atmosphere": ["Cold air", "Damp walls", "Silence"],
     }
-    path = tmp_path / "test.json"
-    path.write_text(json.dumps(rules))
-
-    # Grammar-first path
-    sg = SmartGrammar.from_file(str(path), embedder=FakeEmbedder())
-    sg.index()
+    sg = SmartGrammar(mem_db, "test", embedder=fake_embedder)
+    sg.load_grammar(rules)
 
     text = sg.generate(context="underground cave", temperature=0.0, seed=42)
     assert isinstance(text, str)
@@ -43,7 +21,7 @@ def test_full_pipeline_grammar_first(tmp_path):
     assert "#" not in text
 
 
-def test_save_load_roundtrip(tmp_path):
+def test_from_file(mem_db, fake_embedder, tmp_path):
     rules = {
         "origin": ["#a# #b#"],
         "a": ["hello", "hey", "hi"],
@@ -52,25 +30,48 @@ def test_save_load_roundtrip(tmp_path):
     path = tmp_path / "test.json"
     path.write_text(json.dumps(rules))
 
-    emb = FakeEmbedder()
-    sg = SmartGrammar.from_file(str(path), embedder=emb)
-    sg.index()
-
-    sg.save(str(tmp_path / "test.sg"))
-
-    sg2 = SmartGrammar.load(str(tmp_path / "test.sg"), embedder=emb)
-    text = sg2.generate(context="greeting", temperature=0.0, seed=42)
+    sg = SmartGrammar.from_file(mem_db, str(path), embedder=fake_embedder)
+    text = sg.generate(context="greeting", temperature=0.0, seed=42)
     assert isinstance(text, str)
+    assert "#" not in text
 
 
-def test_add_expansion(tmp_path):
+def test_add_expansion(mem_db, fake_embedder):
     rules = {"origin": ["#a#"], "a": ["x", "y"]}
-    path = tmp_path / "test.json"
-    path.write_text(json.dumps(rules))
-
-    emb = FakeEmbedder()
-    sg = SmartGrammar.from_file(str(path), embedder=emb)
-    sg.index()
+    sg = SmartGrammar(mem_db, "test", embedder=fake_embedder)
+    sg.load_grammar(rules)
     sg.add("a", "z")
 
-    assert "z" in sg._index.grammar.get_expansions("a")
+    grammar = mem_db.get_grammar("test")
+    assert "z" in grammar.get_expansions("a")
+
+
+def test_persistent_db(tmp_path, fake_embedder):
+    db_path = str(tmp_path / "test.db")
+
+    # Write
+    db1 = TrimTabDB(db_path)
+    sg1 = SmartGrammar(db1, "persist", embedder=fake_embedder)
+    sg1.load_grammar({"origin": ["#a#"], "a": ["hello", "world"]})
+
+    # Read in new instance
+    db2 = TrimTabDB(db_path)
+    sg2 = SmartGrammar(db2, "persist", embedder=fake_embedder)
+    text = sg2.generate(context="greeting", temperature=0.0, seed=42)
+    assert isinstance(text, str)
+    assert text in ["hello", "world"]
+
+
+def test_multiple_grammars(mem_db, fake_embedder):
+    sg1 = SmartGrammar(mem_db, "grammar_a", embedder=fake_embedder)
+    sg1.load_grammar({"origin": ["#a#"], "a": ["alpha", "beta"]})
+
+    sg2 = SmartGrammar(mem_db, "grammar_b", embedder=fake_embedder)
+    sg2.load_grammar({"origin": ["#a#"], "a": ["gamma", "delta"]})
+
+    assert set(mem_db.list_grammars()) == {"grammar_a", "grammar_b"}
+
+    text_a = sg1.generate(context="test", temperature=0.0, seed=42)
+    text_b = sg2.generate(context="test", temperature=0.0, seed=42)
+    assert text_a in ["alpha", "beta"]
+    assert text_b in ["gamma", "delta"]
