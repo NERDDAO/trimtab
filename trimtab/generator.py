@@ -21,7 +21,7 @@ class Generator:
         self._grammar = grammar
         self._embedder = embedder
 
-    def generate(
+    async def generate(
         self,
         context: str = "",
         origin: str = "origin",
@@ -46,9 +46,9 @@ class Generator:
             Generated text string.
         """
         rng = random.Random(seed)
-        return self._expand(origin, context, temperature, rng, top_k, min_confidence, no_match_text, depth=0)
+        return await self._expand(origin, context, temperature, rng, top_k, min_confidence, no_match_text, depth=0)
 
-    def _expand(
+    async def _expand(
         self,
         rule: str,
         context: str,
@@ -67,19 +67,19 @@ class Generator:
         if not expansions:
             return f"[{rule}]"
 
-        chosen = self._select(rule, context, expansions, temperature, rng, top_k, min_confidence, no_match_text)
+        chosen = await self._select(rule, context, expansions, temperature, rng, top_k, min_confidence, no_match_text)
 
         result = chosen
         refs = Grammar.extract_refs(chosen)
 
         for ref in refs:
             cascaded_context = f"{context} {result}" if context else result
-            sub_expansion = self._expand(ref, cascaded_context, temperature, rng, top_k, min_confidence, no_match_text, depth + 1)
+            sub_expansion = await self._expand(ref, cascaded_context, temperature, rng, top_k, min_confidence, no_match_text, depth + 1)
             result = result.replace(f"#{ref}#", sub_expansion, 1)
 
         return result
 
-    def _select(
+    async def _select(
         self,
         rule: str,
         context: str,
@@ -100,7 +100,7 @@ class Generator:
         if not context:
             return rng.choice(expansions)
 
-        context_vec = self._embedder.embed([context])[0]
+        context_vec = await self._embedder.create(context)
         candidates = self._db.query(self._grammar, rule, context_vec, top_k=top_k)
 
         if not candidates:
@@ -114,7 +114,7 @@ class Generator:
             return candidates[0][0]
 
         if min_confidence > 0:
-            candidates = [(t, s) for t, s in candidates if s >= min_confidence]
+            candidates = [(t, s, i) for t, s, i in candidates if s >= min_confidence]
             if not candidates:
                 return no_match_text
 

@@ -5,8 +5,6 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 
-import numpy as np
-
 from trimtab.grammar import Grammar
 from trimtab.embedder import Embedder
 
@@ -72,7 +70,7 @@ def extract_ngrams(
     return results
 
 
-def cluster_ngrams(
+async def cluster_ngrams(
     ngrams: list[NGram],
     embedder: Embedder,
     min_cluster_size: int = 3,
@@ -81,7 +79,7 @@ def cluster_ngrams(
 
     Args:
         ngrams: N-grams to cluster.
-        embedder: Embedding model.
+        embedder: Async embedder (Protocol-compatible with EmbedderClient).
         min_cluster_size: Minimum cluster size for HDBSCAN.
 
     Returns:
@@ -91,14 +89,22 @@ def cluster_ngrams(
         return {0: ngrams}
 
     texts = [ng.text for ng in ngrams]
-    vectors = embedder.embed(texts)
+    vectors = await embedder.create_batch(texts)
 
-    import hdbscan
+    try:
+        import hdbscan
+    except ImportError as e:
+        raise ImportError(
+            "cluster_ngrams requires hdbscan. "
+            "Install with `pip install trimtab[build]` or `pip install hdbscan`."
+        ) from e
+
+    import numpy as np
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size,
         metric="euclidean",
     )
-    labels = clusterer.fit_predict(vectors)
+    labels = clusterer.fit_predict(np.array(vectors, dtype=np.float32))
 
     clusters: dict[int, list[NGram]] = {}
     for ng, label in zip(ngrams, labels):
@@ -138,7 +144,7 @@ def clusters_to_grammar(
     return Grammar(rules=rules)
 
 
-def build_grammar(
+async def build_grammar(
     texts: list[str],
     embedder: Embedder,
     min_count: int = 2,
@@ -149,7 +155,7 @@ def build_grammar(
 
     Args:
         texts: Input corpus.
-        embedder: Embedding model.
+        embedder: Async embedder (Protocol-compatible with EmbedderClient).
         min_count: Minimum n-gram frequency.
         min_cluster_size: Minimum HDBSCAN cluster size.
         rule_names: Optional cluster-to-rule-name mapping.
@@ -163,7 +169,7 @@ def build_grammar(
     if not ngrams:
         return Grammar(rules={"origin": ["[empty corpus]"]})
 
-    clusters = cluster_ngrams(ngrams, embedder, min_cluster_size=min_cluster_size)
+    clusters = await cluster_ngrams(ngrams, embedder, min_cluster_size=min_cluster_size)
     logger.info("Found %d clusters", len([k for k in clusters if k != -1]))
 
     grammar = clusters_to_grammar(clusters, rule_names=rule_names)

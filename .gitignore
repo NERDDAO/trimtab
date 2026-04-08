@@ -9,3 +9,4 @@ build/
 *.faiss
 *.sg/
 .env
+.gitnexus

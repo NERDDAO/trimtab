@@ -1,86 +1,33 @@
-"""Embedder protocol and adapters for MiniLM and Ollama."""
+"""Embedder Protocol.
+
+trimtab is BYO-embedder: callers pass any object that structurally matches
+this Protocol. The shape matches ``graphiti_core.embedder.client.EmbedderClient``
+so delve's unified embedder (the primary consumer) plugs in directly.
+
+- ``create(text)`` returns a single vector (``list[float]``).
+- ``create_batch(texts)`` returns one vector per input (``list[list[float]]``).
+
+Both methods are async to match graphiti_core's shape and avoid sync/async
+bridging at the call sites.
+"""
 
 from __future__ import annotations
-import logging
-import numpy as np
-from typing import Protocol
 
-logger = logging.getLogger(__name__)
+from typing import Protocol
 
 
 class Embedder(Protocol):
-    """Protocol for embedding text into vectors."""
-    def embed(self, texts: list[str]) -> np.ndarray:
-        """Embed a list of texts. Returns (N, dim) array."""
+    """Structural Protocol for an async embedder.
+
+    Any class with these two coroutine methods satisfies it — no need to
+    inherit. This matches ``graphiti_core.embedder.client.EmbedderClient``
+    so delve's ``create_embedder()`` factory output plugs in directly.
+    """
+
+    async def create(self, input_data: str | list[str]) -> list[float]:
+        """Embed a single item. Returns one vector."""
         ...
 
-    @property
-    def dimension(self) -> int: ...
-
-
-class MiniLMEmbedder:
-    """Local embedding using sentence-transformers MiniLM (~80MB model)."""
-
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        from sentence_transformers import SentenceTransformer
-        self._model = SentenceTransformer(model_name)
-        self._dim = self._model.get_sentence_embedding_dimension()
-
-    def embed(self, texts: list[str]) -> np.ndarray:
-        return self._model.encode(texts, normalize_embeddings=True)
-
-    @property
-    def dimension(self) -> int:
-        return self._dim
-
-
-class OllamaEmbedder:
-    """Embedding via local Ollama server."""
-
-    def __init__(self, model: str = "nomic-embed-text", base_url: str = "http://localhost:11434"):
-        import requests
-        self._model = model
-        self._base_url = base_url
-        self._dim: int | None = None
-        # Test connection
-        try:
-            resp = requests.get(f"{base_url}/api/tags", timeout=2)
-            resp.raise_for_status()
-        except Exception:
-            raise ConnectionError(f"Cannot connect to Ollama at {base_url}")
-
-    def embed(self, texts: list[str]) -> np.ndarray:
-        import requests
-        results = []
-        for text in texts:
-            resp = requests.post(
-                f"{self._base_url}/api/embed",
-                json={"model": self._model, "input": text},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            embedding = resp.json()["embeddings"][0]
-            results.append(embedding)
-        arr = np.array(results, dtype=np.float32)
-        if self._dim is None:
-            self._dim = arr.shape[1]
-        return arr
-
-    @property
-    def dimension(self) -> int:
-        if self._dim is None:
-            # Probe with a dummy embed
-            arr = self.embed(["test"])
-            self._dim = arr.shape[1]
-        return self._dim
-
-
-def get_default_embedder() -> Embedder:
-    """Try Ollama first, fall back to MiniLM."""
-    try:
-        emb = OllamaEmbedder()
-        logger.info("Using Ollama embedder")
-        return emb
-    except Exception:
-        logger.info("Ollama not available, using MiniLM")
-        return MiniLMEmbedder()
+    async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
+        """Embed a batch. Returns one vector per input, in order."""
+        ...

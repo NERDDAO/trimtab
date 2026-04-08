@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import real_ladybug as lb
 
+from trimtab.embedder import Embedder
 from trimtab.grammar import Grammar
 
 logger = logging.getLogger(__name__)
@@ -141,15 +142,18 @@ class TrimTabDB:
             },
         )
 
-    def upsert_grammar(self, name: str, grammar: Grammar, embedder) -> None:
+    async def upsert_grammar(self, name: str, grammar: Grammar, embedder: Embedder) -> None:
         """Import a Grammar object into the DB. Embeds all expansions.
 
         Args:
             name: Grammar name (e.g., "dev-memory", "narrator").
             grammar: Grammar object with rules and expansions.
-            embedder: Embedder instance for generating vectors.
+            embedder: Async embedder (graphiti_core EmbedderClient or any
+                Protocol-compatible object with ``create`` / ``create_batch``).
         """
-        self._ensure_expansion_table(embedder.dimension)
+        # Probe embedding dimension so we can create the fixed-width table.
+        probe = await embedder.create("dimension probe")
+        self._ensure_expansion_table(len(probe))
 
         # Create grammar node
         self._conn.execute(
@@ -180,12 +184,11 @@ class TrimTabDB:
             if not expansions:
                 continue
 
-            vectors = embedder.embed(expansions)
+            vectors = await embedder.create_batch(expansions)
 
             for text, vec in zip(expansions, vectors):
                 exp_id = f"{name}:{rule_name}:{hash(text)}"
-                vec_list = vec.tolist()
-                self._upsert_expansion(exp_id, text, rule_id, name, vec_list)
+                self._upsert_expansion(exp_id, text, rule_id, name, vec)
 
                 # Create HAS_EXPANSION edge
                 self._conn.execute(
@@ -206,7 +209,7 @@ class TrimTabDB:
         grammar: str,
         rule: str,
         text: str,
-        embedding: np.ndarray,
+        embedding: list[float],
         id: str | None = None,
     ) -> None:
         """Add a single expansion with its embedding vector.
@@ -215,14 +218,14 @@ class TrimTabDB:
             grammar: Grammar name.
             rule: Rule name within the grammar.
             text: Expansion text.
-            embedding: Pre-computed embedding vector.
+            embedding: Pre-computed embedding vector (list of floats, as
+                produced by an embedder's ``create(text)`` method).
             id: Optional custom Expansion id. If None, auto-generates
                 "{grammar}:{rule}:{hash(text)}". Set this to associate the
                 expansion with an external entity (e.g., a KG entity UUID).
         """
         rule_id = f"{grammar}:{rule}"
         exp_id = id if id is not None else f"{grammar}:{rule}:{hash(text)}"
-        vec_list = embedding.tolist()
 
         # Ensure rule exists
         self._conn.execute(
@@ -232,7 +235,7 @@ class TrimTabDB:
         )
 
         # Insert expansion (delete+create to work with vector index)
-        self._upsert_expansion(exp_id, text, rule_id, grammar, vec_list)
+        self._upsert_expansion(exp_id, text, rule_id, grammar, embedding)
 
         # Create HAS_EXPANSION edge
         self._conn.execute(
@@ -243,9 +246,15 @@ class TrimTabDB:
         )
 
     def query(
-        self, grammar: str, rule: str, vector: np.ndarray, top_k: int = 5
+        self, grammar: str, rule: str, vector: list[float], top_k: int = 5
     ) -> list[tuple[str, float, str]]:
         """Vector similarity search within a specific rule's expansions.
+
+        Args:
+            grammar: Grammar name.
+            rule: Rule name.
+            vector: Query embedding (list of floats from embedder.create()).
+            top_k: Number of results to return.
 
         Returns list of (text, score, id) tuples sorted by relevance (highest first).
         Score is cosine similarity (higher = more similar).
@@ -253,7 +262,6 @@ class TrimTabDB:
         via add_expansion(id=...).
         """
         rule_id = f"{grammar}:{rule}"
-        vec_list = vector.tolist()
 
         try:
             result = self._conn.execute(
@@ -261,7 +269,7 @@ class TrimTabDB:
                 "WHERE node.rule_id = $rule_id "
                 "RETURN node.text, distance, node.id "
                 "ORDER BY distance",
-                {"vec": vec_list, "k": top_k * 4, "rule_id": rule_id},
+                {"vec": vector, "k": top_k * 4, "rule_id": rule_id},
             )
             rows = result.get_all()
         except Exception:
@@ -284,7 +292,7 @@ class TrimTabDB:
         return results
 
     def _brute_force_query(
-        self, rule_id: str, vector: np.ndarray, top_k: int
+        self, rule_id: str, vector: list[float], top_k: int
     ) -> list[list]:
         """Fallback: fetch all expansions for rule and compute cosine similarity."""
         result = self._conn.execute(
@@ -296,7 +304,8 @@ class TrimTabDB:
         if not rows:
             return []
 
-        vec_norm = vector / (np.linalg.norm(vector) + 1e-8)
+        query_arr = np.array(vector, dtype=np.float32)
+        vec_norm = query_arr / (np.linalg.norm(query_arr) + 1e-8)
         scored = []
         for text, emb, exp_id in rows:
             emb_arr = np.array(emb, dtype=np.float32)

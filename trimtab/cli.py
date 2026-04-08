@@ -1,17 +1,68 @@
-"""CLI for TrimTab: build, index, generate, add, list, show, export."""
+"""CLI for TrimTab: build, index, generate, add, list, show, export.
+
+The CLI ships a minimal in-file Ollama embedder so trimtab can be used
+standalone without pulling in delve's embedder service. Any Protocol-compatible
+embedder can be used programmatically.
+"""
 
 import argparse
+import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
+import requests
+
+from trimtab.builder import build_grammar
 from trimtab.db import TrimTabDB
 from trimtab.grammar import Grammar
-from trimtab.embedder import get_default_embedder
-from trimtab.builder import build_grammar
 
 
 DEFAULT_DB = str(Path.home() / ".trimtab" / "default.db")
+DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "all-minilm:22m")
+
+
+class _CLIOllamaEmbedder:
+    """Minimal Ollama-backed embedder for the CLI only.
+
+    Satisfies trimtab's ``Embedder`` Protocol structurally (async ``create``
+    and ``create_batch``). Not exported from the package; callers using
+    trimtab as a library should pass their own embedder instance.
+    """
+
+    def __init__(self, model: str = DEFAULT_OLLAMA_MODEL, base_url: str = DEFAULT_OLLAMA_URL):
+        self._model = model
+        self._base_url = base_url.rstrip("/")
+        # Fail fast if Ollama isn't reachable.
+        try:
+            resp = requests.get(f"{self._base_url}/api/tags", timeout=2)
+            resp.raise_for_status()
+        except Exception as e:
+            raise ConnectionError(
+                f"Cannot reach Ollama at {self._base_url}: {e}. "
+                f"Start ollama and run `ollama pull {model}`."
+            ) from e
+
+    async def create(self, input_data):
+        text = input_data if isinstance(input_data, str) else " ".join(input_data)
+        resp = requests.post(
+            f"{self._base_url}/api/embed",
+            json={"model": self._model, "input": text},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return [float(x) for x in resp.json()["embeddings"][0]]
+
+    async def create_batch(self, input_data_list):
+        resp = requests.post(
+            f"{self._base_url}/api/embed",
+            json={"model": self._model, "input": input_data_list},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return [[float(x) for x in vec] for vec in resp.json()["embeddings"]]
 
 
 def _get_db(args) -> TrimTabDB:
@@ -20,24 +71,28 @@ def _get_db(args) -> TrimTabDB:
     return TrimTabDB(db_path)
 
 
-def cmd_index(args):
+def _get_embedder() -> _CLIOllamaEmbedder:
+    return _CLIOllamaEmbedder()
+
+
+async def cmd_index(args):
     """Import a grammar JSON file into the DB."""
     db = _get_db(args)
-    embedder = get_default_embedder()
+    embedder = _get_embedder()
     grammar = Grammar.from_file(args.grammar)
     name = args.name or Path(args.grammar).stem
-    db.upsert_grammar(name, grammar, embedder)
+    await db.upsert_grammar(name, grammar, embedder)
     print(f"Imported '{name}' ({len(grammar.rule_names())} rules)")
 
 
-def cmd_generate(args):
+async def cmd_generate(args):
     """Generate text from a grammar in the DB."""
     db = _get_db(args)
-    embedder = get_default_embedder()
+    embedder = _get_embedder()
 
     from trimtab.generator import Generator
     gen = Generator(db, args.grammar, embedder)
-    text = gen.generate(
+    text = await gen.generate(
         context=args.context,
         temperature=args.temperature,
         seed=args.seed,
@@ -45,11 +100,11 @@ def cmd_generate(args):
     print(text)
 
 
-def cmd_add(args):
+async def cmd_add(args):
     """Add an expansion to a rule."""
     db = _get_db(args)
-    embedder = get_default_embedder()
-    vec = embedder.embed([args.value])[0]
+    embedder = _get_embedder()
+    vec = await embedder.create(args.value)
     custom_id = getattr(args, "id", None) or None
     db.add_expansion(args.grammar, args.rule, args.value, vec, id=custom_id)
     msg = f"Added '{args.value}' to {args.grammar}:{args.rule}"
@@ -58,19 +113,19 @@ def cmd_add(args):
     print(msg)
 
 
-def cmd_build(args):
+async def cmd_build(args):
     """Build grammar from corpus."""
     db = _get_db(args)
-    embedder = get_default_embedder()
+    embedder = _get_embedder()
     with open(args.input) as f:
         texts = [line.strip() for line in f if line.strip()]
-    grammar = build_grammar(texts, embedder, min_count=args.min_count)
+    grammar = await build_grammar(texts, embedder, min_count=args.min_count)
     name = args.name or Path(args.input).stem
-    db.upsert_grammar(name, grammar, embedder)
+    await db.upsert_grammar(name, grammar, embedder)
     print(f"Built and imported '{name}' ({len(grammar.rule_names())} rules)")
 
 
-def cmd_list(args):
+async def cmd_list(args):
     """List all grammars in the DB."""
     db = _get_db(args)
     names = db.list_grammars()
@@ -82,7 +137,7 @@ def cmd_list(args):
         print(f"  {name} ({len(grammar.rule_names())} rules)")
 
 
-def cmd_show(args):
+async def cmd_show(args):
     """Show rules and expansions for a grammar."""
     db = _get_db(args)
     grammar = db.get_grammar(args.grammar)
@@ -96,7 +151,7 @@ def cmd_show(args):
             print(f"    - {exp}")
 
 
-def cmd_export(args):
+async def cmd_export(args):
     """Export a grammar to JSON."""
     db = _get_db(args)
     grammar = db.get_grammar(args.grammar)
@@ -161,7 +216,7 @@ def main():
         "show": cmd_show,
         "export": cmd_export,
     }
-    cmds[args.command](args)
+    asyncio.run(cmds[args.command](args))
 
 
 if __name__ == "__main__":
