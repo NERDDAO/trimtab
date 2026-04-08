@@ -1,0 +1,309 @@
+"""LadybugDB-backed storage for grammars, rules, and embeddings."""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import numpy as np
+import real_ladybug as lb
+
+from trimtab.grammar import Grammar
+
+logger = logging.getLogger(__name__)
+
+
+class TrimTabDB:
+    """LadybugDB-backed storage for grammars, rules, and vector-indexed expansions.
+
+    Graph schema::
+
+        (:Grammar {name}) -[:HAS_RULE]-> (:Rule {id, name, grammar})
+            -[:HAS_EXPANSION]-> (:Expansion {id, text, rule_id, grammar, embedding})
+
+    Args:
+        path: Database path. Use ":memory:" for in-memory (tests/ephemeral),
+              or a file path for persistent storage.
+    """
+
+    def __init__(self, path: str = ":memory:"):
+        self._db = lb.Database(path)
+        self._conn = lb.Connection(self._db)
+        self._init_schema()
+        self._init_vector_extension()
+        self._embedding_dim: int | None = None
+
+    def _init_schema(self) -> None:
+        """Create node and relationship tables if they don't exist."""
+        self._conn.execute(
+            "CREATE NODE TABLE IF NOT EXISTS Grammar(name STRING PRIMARY KEY)"
+        )
+        self._conn.execute(
+            "CREATE NODE TABLE IF NOT EXISTS Rule("
+            "  id STRING PRIMARY KEY,"
+            "  name STRING,"
+            "  grammar STRING"
+            ")"
+        )
+        # Expansion table created lazily in _ensure_expansion_table when we know dimension.
+        self._conn.execute(
+            "CREATE REL TABLE IF NOT EXISTS HAS_RULE(FROM Grammar TO Rule)"
+        )
+
+    def _init_vector_extension(self) -> None:
+        """Load vector extension."""
+        try:
+            self._conn.execute("INSTALL vector")
+        except Exception:
+            pass
+        try:
+            self._conn.execute("LOAD EXTENSION vector")
+        except Exception:
+            pass
+
+    def _ensure_expansion_table(self, dim: int) -> None:
+        """Create Expansion table and HNSW index with correct embedding dimension."""
+        if self._embedding_dim == dim:
+            return
+
+        if self._embedding_dim is not None and self._embedding_dim != dim:
+            # Dimension changed — need to recreate
+            try:
+                self._conn.execute("DROP TABLE IF EXISTS HAS_EXPANSION")
+            except Exception:
+                pass
+            try:
+                self._conn.execute("DROP TABLE IF EXISTS Expansion")
+            except Exception:
+                pass
+
+        try:
+            self._conn.execute(
+                f"CREATE NODE TABLE IF NOT EXISTS Expansion("
+                f"  id STRING PRIMARY KEY,"
+                f"  text STRING,"
+                f"  rule_id STRING,"
+                f"  grammar STRING,"
+                f"  embedding FLOAT[{dim}]"
+                f")"
+            )
+        except Exception:
+            pass  # already exists
+
+        try:
+            self._conn.execute(
+                "CREATE REL TABLE IF NOT EXISTS HAS_EXPANSION(FROM Rule TO Expansion)"
+            )
+        except Exception:
+            pass
+
+        self._embedding_dim = dim
+
+    def _ensure_hnsw_index(self) -> None:
+        """Create HNSW index if it doesn't exist yet."""
+        try:
+            self._conn.execute(
+                "CALL CREATE_VECTOR_INDEX("
+                "  'Expansion', 'expansion_embedding_idx', 'embedding',"
+                "  metric := 'cosine'"
+                ")"
+            )
+        except Exception:
+            pass  # index may already exist
+
+    def _upsert_expansion(
+        self, exp_id: str, text: str, rule_id: str, grammar: str, vec_list: list
+    ) -> None:
+        """Insert or replace an expansion node.
+
+        LadybugDB forbids MERGE/SET on columns covered by a vector index,
+        so we DETACH DELETE the old node (if any) then CREATE a fresh one.
+        """
+        try:
+            self._conn.execute(
+                "MATCH (e:Expansion) WHERE e.id = $id DETACH DELETE e",
+                {"id": exp_id},
+            )
+        except Exception:
+            pass  # node may not exist
+
+        self._conn.execute(
+            "CREATE (e:Expansion {"
+            "  id: $id, text: $text, rule_id: $rule_id,"
+            "  grammar: $grammar, embedding: $embedding"
+            "})",
+            {
+                "id": exp_id,
+                "text": text,
+                "rule_id": rule_id,
+                "grammar": grammar,
+                "embedding": vec_list,
+            },
+        )
+
+    def upsert_grammar(self, name: str, grammar: Grammar, embedder) -> None:
+        """Import a Grammar object into the DB. Embeds all expansions.
+
+        Args:
+            name: Grammar name (e.g., "dev-memory", "narrator").
+            grammar: Grammar object with rules and expansions.
+            embedder: Embedder instance for generating vectors.
+        """
+        self._ensure_expansion_table(embedder.dimension)
+
+        # Create grammar node
+        self._conn.execute(
+            "MERGE (g:Grammar {name: $name})",
+            {"name": name},
+        )
+
+        for rule_name in grammar.rule_names():
+            rule_id = f"{name}:{rule_name}"
+
+            # Create rule node
+            self._conn.execute(
+                "MERGE (r:Rule {id: $id}) ON CREATE SET r.name = $name, r.grammar = $grammar "
+                "ON MATCH SET r.name = $name, r.grammar = $grammar",
+                {"id": rule_id, "name": rule_name, "grammar": name},
+            )
+
+            # Create HAS_RULE edge
+            self._conn.execute(
+                "MATCH (g:Grammar), (r:Rule) "
+                "WHERE g.name = $gname AND r.id = $rid "
+                "MERGE (g)-[:HAS_RULE]->(r)",
+                {"gname": name, "rid": rule_id},
+            )
+
+            # Insert expansions
+            expansions = grammar.get_expansions(rule_name)
+            if not expansions:
+                continue
+
+            vectors = embedder.embed(expansions)
+
+            for text, vec in zip(expansions, vectors):
+                exp_id = f"{name}:{rule_name}:{hash(text)}"
+                vec_list = vec.tolist()
+                self._upsert_expansion(exp_id, text, rule_id, name, vec_list)
+
+                # Create HAS_EXPANSION edge
+                self._conn.execute(
+                    "MATCH (r:Rule), (e:Expansion) "
+                    "WHERE r.id = $rid AND e.id = $eid "
+                    "MERGE (r)-[:HAS_EXPANSION]->(e)",
+                    {"rid": rule_id, "eid": exp_id},
+                )
+
+        # Create HNSW index after all data is inserted (avoids the MERGE/SET
+        # restriction on indexed columns during bulk load).
+        self._ensure_hnsw_index()
+
+        logger.info("Upserted grammar '%s' with %d rules", name, len(grammar.rule_names()))
+
+    def add_expansion(self, grammar: str, rule: str, text: str, embedding: np.ndarray) -> None:
+        """Add a single expansion with its embedding vector."""
+        rule_id = f"{grammar}:{rule}"
+        exp_id = f"{grammar}:{rule}:{hash(text)}"
+        vec_list = embedding.tolist()
+
+        # Ensure rule exists
+        self._conn.execute(
+            "MERGE (r:Rule {id: $id}) ON CREATE SET r.name = $name, r.grammar = $grammar "
+            "ON MATCH SET r.name = $name",
+            {"id": rule_id, "name": rule, "grammar": grammar},
+        )
+
+        # Insert expansion (delete+create to work with vector index)
+        self._upsert_expansion(exp_id, text, rule_id, grammar, vec_list)
+
+        # Create HAS_EXPANSION edge
+        self._conn.execute(
+            "MATCH (r:Rule), (e:Expansion) "
+            "WHERE r.id = $rid AND e.id = $eid "
+            "MERGE (r)-[:HAS_EXPANSION]->(e)",
+            {"rid": rule_id, "eid": exp_id},
+        )
+
+    def query(
+        self, grammar: str, rule: str, vector: np.ndarray, top_k: int = 5
+    ) -> list[tuple[str, float]]:
+        """Vector similarity search within a specific rule's expansions.
+
+        Returns list of (text, score) tuples sorted by relevance (highest first).
+        Score is cosine similarity (higher = more similar).
+        """
+        rule_id = f"{grammar}:{rule}"
+        vec_list = vector.tolist()
+
+        try:
+            result = self._conn.execute(
+                "CALL QUERY_VECTOR_INDEX('Expansion', 'expansion_embedding_idx', $vec, $k) "
+                "WHERE node.rule_id = $rule_id "
+                "RETURN node.text, distance "
+                "ORDER BY distance",
+                {"vec": vec_list, "k": top_k * 4, "rule_id": rule_id},
+            )
+            rows = result.get_all()
+        except Exception:
+            rows = self._brute_force_query(rule_id, vector, top_k)
+
+        results = []
+        for row in rows[:top_k]:
+            text = row[0]
+            distance = float(row[1])
+            score = 1.0 - distance
+            results.append((text, score))
+
+        return results
+
+    def _brute_force_query(
+        self, rule_id: str, vector: np.ndarray, top_k: int
+    ) -> list[list]:
+        """Fallback: fetch all expansions for rule and compute cosine similarity."""
+        result = self._conn.execute(
+            "MATCH (e:Expansion) WHERE e.rule_id = $rule_id "
+            "RETURN e.text, e.embedding",
+            {"rule_id": rule_id},
+        )
+        rows = result.get_all()
+        if not rows:
+            return []
+
+        vec_norm = vector / (np.linalg.norm(vector) + 1e-8)
+        scored = []
+        for text, emb in rows:
+            emb_arr = np.array(emb, dtype=np.float32)
+            emb_norm = emb_arr / (np.linalg.norm(emb_arr) + 1e-8)
+            sim = float(np.dot(vec_norm, emb_norm))
+            distance = 1.0 - sim
+            scored.append([text, distance])
+
+        scored.sort(key=lambda x: x[1])
+        return scored[:top_k]
+
+    def get_grammar(self, name: str) -> Grammar:
+        """Export a grammar from the DB back to a Grammar object."""
+        result = self._conn.execute(
+            "MATCH (r:Rule) WHERE r.grammar = $grammar RETURN r.name",
+            {"grammar": name},
+        )
+        rules: dict[str, list[str]] = {}
+        for row in result.get_all():
+            rule_name = row[0]
+            rules[rule_name] = self.get_expansions(name, rule_name)
+        return Grammar(rules=rules)
+
+    def get_expansions(self, grammar: str, rule: str) -> list[str]:
+        """Get all expansion texts for a specific rule."""
+        rule_id = f"{grammar}:{rule}"
+        result = self._conn.execute(
+            "MATCH (e:Expansion) WHERE e.rule_id = $rule_id RETURN e.text",
+            {"rule_id": rule_id},
+        )
+        return [row[0] for row in result.get_all()]
+
+    def list_grammars(self) -> list[str]:
+        """List all grammar names in the DB."""
+        result = self._conn.execute("MATCH (g:Grammar) RETURN g.name")
+        return [row[0] for row in result.get_all()]
