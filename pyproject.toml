@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smartgrammar"
+version = "0.1.0"
+description = "Context-aware grammar generation with cascading embedding search"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "sentence-transformers>=2.0",
+    "faiss-cpu>=1.7",
+    "numpy>=1.24",
+    "hdbscan>=0.8",
+]
+
+[project.optional-dependencies]
+ollama = ["ollama>=0.1"]
+crew = ["crewai>=0.100"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+smartgrammar = "smartgrammar.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
