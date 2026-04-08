@@ -69,12 +69,26 @@ class SmartGrammar:
         context: str = "",
         temperature: float = 0.3,
         seed: int | None = None,
+        min_confidence: float = 0.0,
+        no_match_text: str = "",
     ) -> str:
-        """Generate text using cascading context-aware expansion."""
+        """Generate text using cascading context-aware expansion.
+
+        Args:
+            context: Context string for embedding-based selection.
+            temperature: 0.0=deterministic, 0.3=recommended, 1.0=random.
+            seed: Random seed for reproducibility.
+            min_confidence: Minimum cosine similarity to accept a match (0.0-1.0).
+                Slots below threshold return no_match_text instead.
+            no_match_text: Text for slots with no confident match.
+        """
         if self._generator is None:
             self.index()
         assert self._generator is not None
-        return self._generator.generate(context=context, temperature=temperature, seed=seed)
+        return self._generator.generate(
+            context=context, temperature=temperature, seed=seed,
+            min_confidence=min_confidence, no_match_text=no_match_text,
+        )
 
     def add(self, rule: str, expansion: str) -> None:
         """Add a new expansion to a rule (auto-embeds and indexes)."""

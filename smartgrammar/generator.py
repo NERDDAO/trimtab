@@ -26,6 +26,8 @@ class Generator:
         temperature: float = 0.3,
         seed: int | None = None,
         top_k: int = 5,
+        min_confidence: float = 0.0,
+        no_match_text: str = "",
     ) -> str:
         """Generate text by cascading context through the grammar tree.
 
@@ -35,12 +37,17 @@ class Generator:
             temperature: 0.0 = always top-1, 1.0 = uniform random from top-k.
             seed: Random seed for reproducibility.
             top_k: Number of candidates to consider at each level.
+            min_confidence: Minimum cosine similarity score to accept a match.
+                If the best candidate scores below this, returns no_match_text
+                for that slot instead. Range: 0.0 (accept anything) to 1.0 (exact match only).
+            no_match_text: Text to use when no candidate meets min_confidence.
+                Defaults to empty string (slot omitted silently).
 
         Returns:
             Generated text string.
         """
         rng = random.Random(seed)
-        return self._expand(origin, context, temperature, rng, top_k, depth=0)
+        return self._expand(origin, context, temperature, rng, top_k, min_confidence, no_match_text, depth=0)
 
     def _expand(
         self,
@@ -49,6 +56,8 @@ class Generator:
         temperature: float,
         rng: random.Random,
         top_k: int,
+        min_confidence: float,
+        no_match_text: str,
         depth: int,
     ) -> str:
         """Recursively expand a rule with cascading context."""
@@ -60,7 +69,7 @@ class Generator:
             return f"[{rule}]"
 
         # Select an expansion
-        chosen = self._select(rule, context, expansions, temperature, rng, top_k)
+        chosen = self._select(rule, context, expansions, temperature, rng, top_k, min_confidence, no_match_text)
 
         # Expand any rule references in the chosen template
         result = chosen
@@ -69,7 +78,7 @@ class Generator:
         for ref in refs:
             # Cascade: context grows with what we've resolved so far
             cascaded_context = f"{context} {result}" if context else result
-            sub_expansion = self._expand(ref, cascaded_context, temperature, rng, top_k, depth + 1)
+            sub_expansion = self._expand(ref, cascaded_context, temperature, rng, top_k, min_confidence, no_match_text, depth + 1)
             result = result.replace(f"#{ref}#", sub_expansion, 1)
 
         return result
@@ -82,6 +91,8 @@ class Generator:
         temperature: float,
         rng: random.Random,
         top_k: int,
+        min_confidence: float = 0.0,
+        no_match_text: str = "",
     ) -> str:
         """Select an expansion using embedding similarity + temperature."""
         if len(expansions) == 1:
@@ -100,13 +111,24 @@ class Generator:
         candidates = self.gi.query(rule, context_vec, top_k=top_k)
 
         if not candidates:
-            return rng.choice(expansions)
+            return no_match_text if min_confidence > 0 else rng.choice(expansions)
+
+        # Check confidence threshold
+        best_score = candidates[0][1]
+        if min_confidence > 0 and best_score < min_confidence:
+            return no_match_text
 
         # Temperature 0.0 = always top-1
         if temperature <= 0.0:
             return candidates[0][0]
 
         # Temperature-weighted sampling from candidates
+        # Filter by confidence first
+        if min_confidence > 0:
+            candidates = [(t, s) for t, s in candidates if s >= min_confidence]
+            if not candidates:
+                return no_match_text
+
         texts = [c[0] for c in candidates]
         scores = np.array([c[1] for c in candidates])
 
