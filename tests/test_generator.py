@@ -1,40 +1,19 @@
 """Tests for cascading context-aware generation."""
+
 import pytest
-import numpy as np
 from trimtab.grammar import Grammar
-from trimtab.index import GrammarIndex
 from trimtab.generator import Generator
 
 
-class FakeEmbedder:
-    def __init__(self, dim=8):
-        self._dim = dim
-
-    def embed(self, texts: list[str]) -> np.ndarray:
-        vecs = []
-        for t in texts:
-            np.random.seed(hash(t) % (2**31))
-            vecs.append(np.random.randn(self._dim).astype(np.float32))
-        arr = np.array(vecs)
-        norms = np.linalg.norm(arr, axis=1, keepdims=True)
-        return arr / (norms + 1e-8)
-
-    @property
-    def dimension(self):
-        return self._dim
-
-
 @pytest.fixture
-def gen():
-    g = Grammar.from_dict({
+def gen(mem_db, fake_embedder):
+    grammar = Grammar.from_dict({
         "origin": ["#mood# and #detail#."],
         "mood": ["dark and cold", "bright and warm", "eerie and still"],
         "detail": ["shadows move", "birds sing", "silence reigns"],
     })
-    emb = FakeEmbedder()
-    gi = GrammarIndex(g, emb)
-    gi.build()
-    return Generator(gi)
+    mem_db.upsert_grammar("test", grammar, fake_embedder)
+    return Generator(mem_db, "test", fake_embedder)
 
 
 def test_generate_produces_text(gen):
@@ -55,7 +34,7 @@ def test_generate_temperature_1_is_random(gen):
     for seed in range(20):
         text = gen.generate(context="anything", temperature=1.0, seed=seed)
         results.add(text)
-    assert len(results) > 1  # should have variety
+    assert len(results) > 1
 
 
 def test_generate_no_rule_refs_in_output(gen):
