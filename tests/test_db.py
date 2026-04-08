@@ -61,7 +61,10 @@ def test_query_returns_results(mem_db, fake_embedder):
     ctx_vec = fake_embedder.embed(["underground darkness"])[0]
     results = mem_db.query("test", "a", ctx_vec, top_k=3)
     assert len(results) > 0
-    assert all(isinstance(r[0], str) and isinstance(r[1], float) for r in results)
+    assert all(
+        isinstance(r[0], str) and isinstance(r[1], float) and isinstance(r[2], str)
+        for r in results
+    )
 
 
 def test_query_nonexistent_rule(mem_db, fake_embedder):
@@ -81,3 +84,28 @@ def test_get_expansions(mem_db, fake_embedder):
     mem_db.upsert_grammar("test", grammar, fake_embedder)
     expansions = mem_db.get_expansions("test", "a")
     assert set(expansions) == {"x", "y", "z"}
+
+
+def test_add_expansion_with_custom_id(mem_db, fake_embedder):
+    grammar = Grammar.from_dict({"origin": ["#a#"], "a": ["x"]})
+    mem_db.upsert_grammar("test", grammar, fake_embedder)
+
+    vec = fake_embedder.embed(["The Dark Crypt"])
+    mem_db.add_expansion("test", "a", "The Dark Crypt", vec[0], id="entity-uuid-123")
+
+    results = mem_db.query("test", "a", vec[0], top_k=1)
+    assert len(results) > 0
+    text, score, exp_id = results[0]
+    assert text == "The Dark Crypt"
+    assert exp_id == "entity-uuid-123"
+
+
+def test_query_returns_auto_generated_id_by_default(mem_db, fake_embedder):
+    grammar = Grammar.from_dict({"origin": ["#a#"], "a": ["hello"]})
+    mem_db.upsert_grammar("test", grammar, fake_embedder)
+
+    vec = fake_embedder.embed(["greeting"])[0]
+    results = mem_db.query("test", "a", vec, top_k=1)
+    assert len(results) > 0
+    text, score, exp_id = results[0]
+    assert exp_id.startswith("test:a:")
