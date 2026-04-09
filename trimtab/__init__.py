@@ -12,16 +12,17 @@ from pathlib import Path
 from trimtab.builder import build_grammar, cluster_ngrams, extract_ngrams
 from trimtab.db import TrimTabDB
 from trimtab.embedder import Embedder
-from trimtab.generator import Generator
+from trimtab.generator import GenerationResult, Generator
 from trimtab.grammar import Grammar
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "Grammar",
     "Embedder",
     "TrimTabDB",
     "Generator",
+    "GenerationResult",
     "build_grammar",
     "extract_ngrams",
     "cluster_ngrams",
@@ -88,8 +89,14 @@ class SmartGrammar:
         seed: int | None = None,
         min_confidence: float = 0.0,
         no_match_text: str = "",
-    ) -> str:
-        """Generate text using cascading context-aware expansion."""
+    ) -> GenerationResult:
+        """Generate text using cascading context-aware expansion.
+
+        Returns a ``GenerationResult`` with both the final ``text`` and the
+        ``ids`` of the expansions picked at each rule level. Consumers that
+        only want the text can read ``.text``; consumers building tool-using
+        agents can use ``.ids`` as center-node anchors for KG search.
+        """
         return await self._generator.generate(
             context=context,
             temperature=temperature,
