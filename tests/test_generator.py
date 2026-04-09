@@ -125,3 +125,30 @@ async def test_generation_result_is_namedtuple_unpackable(gen):
     text, ids = result  # tuple unpacking still works
     assert text == result.text
     assert ids == result.ids
+
+
+@pytest.mark.asyncio
+async def test_upsert_grammar_honors_explicit_expansion_ids(mem_db, fake_embedder):
+    """Grammar dict entries of the shape ``{"text", "id"}`` should flow
+    through ``upsert_grammar`` with the explicit id preserved — no two-step
+    upsert + add_expansion dance required."""
+    grammar = Grammar.from_dict(
+        {
+            "origin": ["applicant #skill#"],
+            "skill": [
+                {"text": "audited defi protocols", "id": "applicant/security/uuid-audit"},
+                {"text": "found critical bugs", "id": "applicant/security/uuid-bugs"},
+            ],
+        }
+    )
+    await mem_db.upsert_grammar("skills", grammar, fake_embedder)
+
+    generator = Generator(mem_db, "skills", fake_embedder)
+    result = await generator.generate(context="audit work", temperature=0.0, seed=0)
+
+    # The cascade walks origin → skill → one of the custom-id expansions.
+    # At least one of the walked ids should be a custom one.
+    custom_ids = [i for i in result.ids if i.startswith("applicant/")]
+    assert custom_ids, f"expected a custom id in walk, got {result.ids}"
+    # And none of the rows for the "skill" rule should have auto-generated ids.
+    assert not any(i.startswith("skills:skill:") for i in result.ids)

@@ -145,6 +145,11 @@ class TrimTabDB:
     async def upsert_grammar(self, name: str, grammar: Grammar, embedder: Embedder) -> None:
         """Import a Grammar object into the DB. Embeds all expansions.
 
+        Honors explicit expansion ids when the grammar supplies them (via
+        ``{"text", "id"}`` dict entries in ``Grammar.rules``). Expansions
+        with no explicit id fall back to the auto-generated
+        ``{name}:{rule_name}:{hash(text)}`` shape.
+
         Args:
             name: Grammar name (e.g., "dev-memory", "narrator").
             grammar: Grammar object with rules and expansions.
@@ -179,15 +184,16 @@ class TrimTabDB:
                 {"gname": name, "rid": rule_id},
             )
 
-            # Insert expansions
-            expansions = grammar.get_expansions(rule_name)
-            if not expansions:
+            # Insert expansions — honor consumer-supplied ids when present.
+            expansion_items = grammar.get_expansion_items(rule_name)
+            if not expansion_items:
                 continue
 
-            vectors = await embedder.create_batch(expansions)
+            texts = [text for text, _ in expansion_items]
+            vectors = await embedder.create_batch(texts)
 
-            for text, vec in zip(expansions, vectors):
-                exp_id = f"{name}:{rule_name}:{hash(text)}"
+            for (text, explicit_id), vec in zip(expansion_items, vectors, strict=True):
+                exp_id = explicit_id if explicit_id else f"{name}:{rule_name}:{hash(text)}"
                 self._upsert_expansion(exp_id, text, rule_id, name, vec)
 
                 # Create HAS_EXPANSION edge
@@ -318,15 +324,21 @@ class TrimTabDB:
         return scored[:top_k]
 
     def get_grammar(self, name: str) -> Grammar:
-        """Export a grammar from the DB back to a Grammar object."""
+        """Export a grammar from the DB back to a Grammar object.
+
+        Returns expansions as plain text strings (the round-trip shape).
+        To also get expansion ids, use ``get_expansions_with_ids``.
+        """
+        from trimtab.grammar import ExpansionEntry
+
         result = self._conn.execute(
             "MATCH (r:Rule) WHERE r.grammar = $grammar RETURN r.name",
             {"grammar": name},
         )
-        rules: dict[str, list[str]] = {}
+        rules: dict[str, list[ExpansionEntry]] = {}
         for row in result.get_all():
             rule_name = row[0]
-            rules[rule_name] = self.get_expansions(name, rule_name)
+            rules[rule_name] = list(self.get_expansions(name, rule_name))
         return Grammar(rules=rules)
 
     def get_expansions(self, grammar: str, rule: str) -> list[str]:
