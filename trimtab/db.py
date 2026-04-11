@@ -350,6 +350,25 @@ class TrimTabDB:
         )
         return [row[0] for row in result.get_all()]
 
+    def list_entries(self, grammar: str, rule: str) -> list[tuple[str, str]]:
+        """List all (text, id) pairs for a rule — the store-read mode.
+
+        Unlike ``query`` (which does embedding similarity search), this returns
+        every expansion in the rule with no ranking or filtering. Use this when
+        you want to treat a rule as a flat table rather than a search index.
+
+        Returns:
+            List of ``(text, id)`` tuples. The id is the consumer-supplied
+            expansion id (e.g., a KG entity UUID or path-tagged string), or
+            the auto-generated ``{grammar}:{rule}:{hash}`` if none was set.
+        """
+        rule_id = f"{grammar}:{rule}"
+        result = self._conn.execute(
+            "MATCH (e:Expansion) WHERE e.rule_id = $rule_id RETURN e.text, e.id",
+            {"rule_id": rule_id},
+        )
+        return [(row[0], row[1]) for row in result.get_all()]
+
     def list_grammars(self) -> list[str]:
         """List all grammar names in the DB."""
         result = self._conn.execute("MATCH (g:Grammar) RETURN g.name")

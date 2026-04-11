@@ -120,3 +120,10 @@ class SmartGrammar:
     def export(self) -> Grammar:
         """Export the grammar from the DB as a Grammar object."""
         return self._db.get_grammar(self._name)
+
+    def list_entries(self, rule: str) -> list[tuple[str, str]]:
+        """List all (text, id) pairs in a rule — store-read mode.
+
+        No embedding search. Returns every expansion as ``(text, id)``.
+        """
+        return self._db.list_entries(self._name, rule)
