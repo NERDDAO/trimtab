@@ -23,3 +23,6 @@ trimtab = "trimtab.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.pyright]
+stubPath = "typestubs"

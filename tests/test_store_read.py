@@ -4,11 +4,11 @@ from trimtab.grammar import Grammar
 
 
 class FakeEmbedder:
-    async def create(self, text: str) -> list[float]:
+    async def create(self, input_data: str | list[str]) -> list[float]:
         return [0.1] * 8
 
-    async def create_batch(self, texts: list[str]) -> list[list[float]]:
-        return [[0.1] * 8 for _ in texts]
+    async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
+        return [[0.1] * 8 for _ in input_data_list]
 
 
 @pytest.mark.asyncio
