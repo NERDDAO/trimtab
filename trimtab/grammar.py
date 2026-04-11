@@ -12,7 +12,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-_RULE_PATTERN = re.compile(r"#(\w+)#")
+_RULE_PATTERN = re.compile(r"#([\w\-]+)#")
 
 # An expansion is either plain text or {"text": ..., "id": ...}.
 ExpansionEntry = str | dict[str, str]
