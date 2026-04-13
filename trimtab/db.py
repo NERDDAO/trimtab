@@ -210,6 +210,55 @@ class TrimTabDB:
 
         logger.info("Upserted grammar '%s' with %d rules", name, len(grammar.rule_names()))
 
+    async def register_grammar(self, name: str, grammar: Grammar, embedder: Embedder) -> None:
+        """Register a grammar's rule structure without embedding expansions.
+
+        Use this when expansion vectors will be added separately via
+        ``add_expansion`` with precomputed embeddings — for example, when
+        loading from a cache of previously-embedded text. Creates the
+        Grammar node, Rule nodes, and HAS_RULE edges. Does not create
+        Expansion nodes.
+
+        The embedder is only used to probe the vector dimension if this is
+        the first grammar being registered on this DB instance. Subsequent
+        calls reuse the cached dimension and make zero embedder calls.
+
+        Args:
+            name: Grammar name (e.g. "bonfire123:applicant_review").
+            grammar: Grammar object with rule structure.
+            embedder: Async embedder (only used for the one-shot dim probe).
+        """
+        if self._embedding_dim is None:
+            probe = await embedder.create("dimension probe")
+            self._ensure_expansion_table(len(probe))
+
+        self._conn.execute(
+            "MERGE (g:Grammar {name: $name})",
+            {"name": name},
+        )
+
+        for rule_name in grammar.rule_names():
+            rule_id = f"{name}:{rule_name}"
+            self._conn.execute(
+                "MERGE (r:Rule {id: $id}) ON CREATE SET r.name = $name, r.grammar = $grammar "
+                "ON MATCH SET r.name = $name, r.grammar = $grammar",
+                {"id": rule_id, "name": rule_name, "grammar": name},
+            )
+            self._conn.execute(
+                "MATCH (g:Grammar), (r:Rule) "
+                "WHERE g.name = $gname AND r.id = $rid "
+                "MERGE (g)-[:HAS_RULE]->(r)",
+                {"gname": name, "rid": rule_id},
+            )
+
+        self._ensure_hnsw_index()
+
+        logger.info(
+            "Registered grammar '%s' with %d rules (no embeddings)",
+            name,
+            len(grammar.rule_names()),
+        )
+
     def add_expansion(
         self,
         grammar: str,

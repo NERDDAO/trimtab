@@ -109,3 +109,86 @@ def test_query_returns_auto_generated_id_by_default(mem_db, fake_embedder):
     assert len(results) > 0
     text, score, exp_id = results[0]
     assert exp_id.startswith("test:a:")
+
+
+# ---------------------------------------------------------------------------
+# register_grammar tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeEmbedder:
+    """Embedder double that returns fixed-dim zero vectors."""
+
+    def __init__(self, dim: int = 4) -> None:
+        self.dim = dim
+        self.create_calls: list[str] = []
+
+    async def create(self, text: str) -> list[float]:
+        self.create_calls.append(text)
+        return [0.0] * self.dim
+
+    async def create_batch(self, texts: list[str]) -> list[list[float]]:
+        return [await self.create(t) for t in texts]
+
+
+@pytest.mark.asyncio
+async def test_register_grammar_creates_structure_without_embedding():
+    """register_grammar creates Grammar + Rule nodes + HAS_RULE edges but
+    does not embed any expansions. The only embedder call is the one
+    dimension probe."""
+    from trimtab.db import TrimTabDB
+
+    db = TrimTabDB(":memory:")
+    embedder = _FakeEmbedder(dim=4)
+    grammar = Grammar.from_dict({
+        "origin": ["#greeting# #name#"],
+        "greeting": ["hello", "hi"],
+        "name": ["world"],
+    })
+
+    await db.register_grammar("test_grammar", grammar, embedder)
+
+    # Only the dimension probe should have been embedded
+    assert embedder.create_calls == ["dimension probe"]
+
+    # Grammar + Rule nodes exist
+    assert "test_grammar" in db.list_grammars()
+
+    # No expansions yet
+    assert db.get_expansions("test_grammar", "greeting") == []
+    assert db.get_expansions("test_grammar", "name") == []
+
+
+@pytest.mark.asyncio
+async def test_register_grammar_idempotent_second_call_no_probe():
+    """Second call on same DB doesn't re-probe embedding dim."""
+    from trimtab.db import TrimTabDB
+
+    db = TrimTabDB(":memory:")
+    embedder = _FakeEmbedder(dim=4)
+    grammar = Grammar.from_dict({"origin": ["hello"]})
+
+    await db.register_grammar("g1", grammar, embedder)
+    embedder.create_calls.clear()
+
+    await db.register_grammar("g2", grammar, embedder)
+    # Dim already known, no probe needed
+    assert embedder.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_register_grammar_then_add_expansion_works():
+    """After register_grammar, add_expansion with precomputed vector works
+    and query finds the result."""
+    from trimtab.db import TrimTabDB
+
+    db = TrimTabDB(":memory:")
+    embedder = _FakeEmbedder(dim=4)
+    grammar = Grammar.from_dict({"origin": []})
+
+    await db.register_grammar("g", grammar, embedder)
+    db.add_expansion("g", "origin", "hello world", [1.0, 0.0, 0.0, 0.0])
+
+    results = db.query("g", "origin", [1.0, 0.0, 0.0, 0.0], top_k=1)
+    assert len(results) == 1
+    assert results[0][0] == "hello world"
