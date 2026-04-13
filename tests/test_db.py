@@ -117,18 +117,23 @@ def test_query_returns_auto_generated_id_by_default(mem_db, fake_embedder):
 
 
 class _FakeEmbedder:
-    """Embedder double that returns fixed-dim zero vectors."""
+    """Embedder double that returns fixed-dim zero vectors.
+
+    Parameter names mirror the ``trimtab.embedder.Embedder`` Protocol
+    (``input_data`` / ``input_data_list``) so structural typing accepts it.
+    """
 
     def __init__(self, dim: int = 4) -> None:
         self.dim = dim
         self.create_calls: list[str] = []
 
-    async def create(self, text: str) -> list[float]:
+    async def create(self, input_data: str | list[str]) -> list[float]:
+        text = input_data if isinstance(input_data, str) else " ".join(input_data)
         self.create_calls.append(text)
         return [0.0] * self.dim
 
-    async def create_batch(self, texts: list[str]) -> list[list[float]]:
-        return [await self.create(t) for t in texts]
+    async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
+        return [await self.create(t) for t in input_data_list]
 
 
 @pytest.mark.asyncio
