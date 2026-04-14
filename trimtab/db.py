@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -113,29 +115,28 @@ class TrimTabDB:
             raise TrimTabDimensionError(expected=self._embedding_dim, got=dim)
 
         # First-ever creation (fresh DB with no migration, no prior put).
-        try:
-            self._conn.execute(
-                f"CREATE NODE TABLE IF NOT EXISTS Rule("
-                f"  id STRING PRIMARY KEY,"
-                f"  text STRING,"
-                f"  grammar STRING,"
-                f"  symbol STRING,"
-                f"  metadata STRING,"
-                f"  embedding FLOAT[{dim}],"
-                f"  embedded BOOLEAN,"
-                f"  created_at STRING,"
-                f"  updated_at STRING"
-                f")"
-            )
-        except Exception:
-            pass
-        try:
-            self._conn.execute(
-                "CREATE REL TABLE IF NOT EXISTS HAS_RULE(FROM Symbol TO Rule)"
-            )
-        except Exception:
-            pass
-        # Create HNSW index on the embedding column.
+        # CREATE ... IF NOT EXISTS handles the idempotent case without raising,
+        # so we intentionally do NOT wrap these in try/except — genuine
+        # creation failures should propagate instead of leaving the DB in an
+        # indeterminate state with _embedding_dim claiming the table exists.
+        self._conn.execute(
+            f"CREATE NODE TABLE IF NOT EXISTS Rule("
+            f"  id STRING PRIMARY KEY,"
+            f"  text STRING,"
+            f"  grammar STRING,"
+            f"  symbol STRING,"
+            f"  metadata STRING,"
+            f"  embedding FLOAT[{dim}],"
+            f"  embedded BOOLEAN,"
+            f"  created_at STRING,"
+            f"  updated_at STRING"
+            f")"
+        )
+        self._conn.execute(
+            "CREATE REL TABLE IF NOT EXISTS HAS_RULE(FROM Symbol TO Rule)"
+        )
+        # Create HNSW index on the embedding column. The index creation can
+        # legitimately raise if it already exists, so narrow the catch here.
         try:
             self._conn.execute(
                 "CALL CREATE_VECTOR_INDEX("
@@ -143,8 +144,8 @@ class TrimTabDB:
                 "  metric := 'cosine'"
                 ")"
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("HNSW index creation (likely already exists): %s", e)
         self._embedding_dim = dim
 
     def _ensure_expansion_table(self, dim: int) -> None:
@@ -235,8 +236,6 @@ class TrimTabDB:
         vector: list[float],
     ) -> Rule:
         """Insert a Rule into v0.5 tables. Vector must be pre-computed."""
-        import json
-
         self._ensure_rule_table(len(vector))
 
         # Ensure Grammar and Symbol nodes exist.
@@ -259,13 +258,12 @@ class TrimTabDB:
         )
 
         # Delete-then-create pattern (vector-indexed columns reject SET).
-        try:
-            self._conn.execute(
-                "MATCH (r:Rule) WHERE r.id = $id DETACH DELETE r",
-                {"id": rule.id},
-            )
-        except Exception:
-            pass
+        # LadybugDB's DETACH DELETE on a non-matching node is a no-op, so
+        # we do NOT wrap this in try/except — let genuine failures propagate.
+        self._conn.execute(
+            "MATCH (r:Rule) WHERE r.id = $id DETACH DELETE r",
+            {"id": rule.id},
+        )
 
         # Serialize updated_at (may be None on construction if caller built
         # a Rule with no updated_at override; __post_init__ normally fills it
@@ -286,6 +284,11 @@ class TrimTabDB:
                 "text": rule.text,
                 "grammar": grammar,
                 "symbol": symbol,
+                # LadybugDB auto-parses JSON-looking string values on write
+                # and re-serializes them as Cypher map literals, breaking
+                # json.loads on read. Double-encoding produces a string whose
+                # outer layer is opaque to LadybugDB's parser. Match the
+                # double-decode in _get_rules below.
                 "metadata": json.dumps(json.dumps(rule.metadata)),
                 "embedding": vector,
                 "embedded": True,
@@ -303,9 +306,6 @@ class TrimTabDB:
 
     def _get_rules(self, grammar: str, symbol: str) -> list[Rule]:
         """Return all rules under (grammar, symbol), insertion-ordered by created_at."""
-        import json
-        from datetime import datetime
-
         result = self._conn.execute(
             "MATCH (r:Rule) "
             "WHERE r.grammar = $g AND r.symbol = $s "
@@ -316,6 +316,8 @@ class TrimTabDB:
         rules: list[Rule] = []
         for row in result.get_all():
             rid, rtext, rmeta, rcreated, rupdated = row
+            # Double-decode — matches the double-encode in _put_rule_with_vector.
+            # See that method's comment for the LadybugDB rationale.
             meta = json.loads(json.loads(rmeta)) if rmeta else {}
             rules.append(
                 Rule(
