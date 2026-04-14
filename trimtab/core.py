@@ -13,12 +13,13 @@ for advanced use.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from trimtab.db import TrimTabDB
 from trimtab.embedder import Embedder
-from trimtab.grammar import Rule, upgrade_entry
+from trimtab.grammar import Grammar, Rule, upgrade_entry
 
 if TYPE_CHECKING:  # avoid eager OllamaEmbedder import at module load
     pass
@@ -250,3 +251,43 @@ class TrimTab:
     def drop(self, grammar: str) -> None:
         """Remove a whole grammar — all rules, symbols, and the Grammar node."""
         self._db._drop_grammar(grammar)
+
+    # --- file I/O -------------------------------------------------------------
+
+    async def load_file(self, path: "str | Path", grammar: str) -> None:
+        """Load a Tracery JSON file into a grammar.
+
+        Each top-level key in the JSON becomes a symbol under the grammar.
+        Plain string entries are auto-upgraded to Rule objects with
+        generated ids; dict entries with ``text``/``id``/``metadata`` keys
+        are preserved via ``upgrade_entry``.
+
+        This is async because it calls ``put_many`` to batch-embed each
+        symbol's entries.
+        """
+        g = Grammar.from_file(path)
+        for symbol_name in g.rule_names():
+            entries = g.rules.get(symbol_name, [])
+            if not entries:
+                continue
+            await self.put_many(grammar=grammar, symbol=symbol_name, entries=entries)
+
+    def export_file(self, path: "str | Path", grammar: str) -> None:
+        """Export a grammar to a Tracery-compatible JSON file.
+
+        Each symbol becomes a top-level key; each rule becomes a
+        ``{"text", "id", "metadata"?}`` dict (metadata omitted if empty).
+        The result is Tracery-compatible when consumers handle both
+        string-valued and dict-valued entries.
+        """
+        data: dict[str, list[dict[str, Any] | str]] = {}
+        for symbol_name in self._db._list_symbols(grammar):
+            rules = self._db._get_rules(grammar, symbol_name)
+            entries: list[dict[str, Any] | str] = []
+            for r in rules:
+                entry: dict[str, Any] = {"text": r.text, "id": r.id}
+                if r.metadata:
+                    entry["metadata"] = r.metadata
+                entries.append(entry)
+            data[symbol_name] = entries
+        Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
