@@ -155,3 +155,47 @@ def test_drop_grammar_removes_everything(db: TrimTabDB):
         "MATCH (s:Symbol) WHERE s.grammar = 'g1' RETURN s.name"
     ).get_all()
     assert syms == []
+
+
+def test_search_rules_returns_full_rules(db: TrimTabDB):
+    db._put_rule_with_vector("g1", "friends", Rule(text="Alice"), [0.9] * 16)
+    db._put_rule_with_vector("g1", "friends", Rule(text="Bob"), [0.1] * 16)
+    # Query closer to Alice's vector.
+    results = db._search_rules("g1", "friends", query_vector=[0.9] * 16, top_k=2)
+    assert len(results) >= 1
+    assert results[0].text == "Alice"
+
+
+def test_search_rules_includes_metadata(db: TrimTabDB):
+    db._put_rule_with_vector(
+        "g1", "friends",
+        Rule(text="Alice", metadata={"rank": 1, "entityId": "ent_a"}),
+        [0.5] * 16,
+    )
+    results = db._search_rules("g1", "friends", query_vector=[0.5] * 16, top_k=5)
+    assert len(results) == 1
+    assert results[0].metadata == {"rank": 1, "entityId": "ent_a"}
+
+
+def test_search_rules_empty_symbol(db: TrimTabDB):
+    # No data inserted; search should return empty without raising.
+    results = db._search_rules("g1", "nowhere", query_vector=[0.1] * 16, top_k=5)
+    assert results == []
+
+
+def test_list_symbols(db: TrimTabDB):
+    db._put_rule_with_vector("g1", "friends", Rule(text="A"), [0.1] * 16)
+    db._put_rule_with_vector("g1", "quests", Rule(text="Q"), [0.2] * 16)
+    symbols = db._list_symbols("g1")
+    assert set(symbols) == {"friends", "quests"}
+
+
+def test_list_symbols_empty_grammar(db: TrimTabDB):
+    assert db._list_symbols("nonexistent") == []
+
+
+def test_count_rules(db: TrimTabDB):
+    db._put_rule_with_vector("g1", "friends", Rule(text="A"), [0.1] * 16)
+    db._put_rule_with_vector("g1", "friends", Rule(text="B"), [0.2] * 16)
+    assert db._count_rules("g1", "friends") == 2
+    assert db._count_rules("g1", "missing") == 0

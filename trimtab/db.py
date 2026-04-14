@@ -448,6 +448,111 @@ class TrimTabDB:
             {"g_name": grammar},
         )
 
+    def _search_rules(
+        self,
+        grammar: str,
+        symbol: str,
+        query_vector: list[float],
+        top_k: int = 5,
+    ) -> list[Rule]:
+        """Vector similarity search within (grammar, symbol). Returns list[Rule].
+
+        Uses LadybugDB's HNSW index when available, falls back to a
+        brute-force cosine scan if HNSW returns nothing (e.g., recently
+        inserted rows that haven't been indexed yet).
+        """
+        if self._embedding_dim is None:
+            # No Rule table exists yet — nothing to search.
+            return []
+
+        rows: list[list] = []
+        try:
+            result = self._conn.execute(
+                "CALL QUERY_VECTOR_INDEX('Rule', 'rule_embedding_idx', $vec, $k) "
+                "WHERE node.grammar = $g AND node.symbol = $s "
+                "RETURN node.id, node.text, node.metadata, node.created_at, node.updated_at, distance "
+                "ORDER BY distance",
+                {"vec": query_vector, "k": top_k * 4, "g": grammar, "s": symbol},
+            )
+            rows = [list(r) for r in result.get_all()]
+        except Exception:
+            rows = []
+
+        if not rows:
+            # Brute-force fallback over the (grammar, symbol) slice.
+            rows = self._brute_force_search(grammar, symbol, query_vector, top_k)
+
+        rules: list[Rule] = []
+        for row in rows[:top_k]:
+            rid, rtext, rmeta, rcreated, rupdated = row[0], row[1], row[2], row[3], row[4]
+            # Strip the "json:" prefix that _put_rule_with_vector adds.
+            meta = json.loads(rmeta[5:]) if rmeta else {}
+            rules.append(
+                Rule(
+                    text=rtext,
+                    id=rid,
+                    metadata=meta,
+                    created_at=datetime.fromisoformat(rcreated),
+                    updated_at=datetime.fromisoformat(rupdated),
+                )
+            )
+        return rules
+
+    def _brute_force_search(
+        self, grammar: str, symbol: str, query_vector: list[float], top_k: int
+    ) -> list[list]:
+        """Fallback cosine search when HNSW returns nothing.
+
+        Returns rows shaped to match _search_rules's expected schema:
+        [id, text, metadata, created_at, updated_at] (distance is dropped
+        because the caller doesn't surface it).
+        """
+        try:
+            result = self._conn.execute(
+                "MATCH (r:Rule) WHERE r.grammar = $g AND r.symbol = $s "
+                "RETURN r.id, r.text, r.metadata, r.created_at, r.updated_at, r.embedding",
+                {"g": grammar, "s": symbol},
+            )
+            db_rows = result.get_all()
+        except Exception:
+            db_rows = []
+        if not db_rows:
+            return []
+        q = np.array(query_vector, dtype=np.float32)
+        q_norm = q / (np.linalg.norm(q) + 1e-8)
+        scored: list[tuple[float, list]] = []
+        for rid, rtext, rmeta, rcreated, rupdated, remb in db_rows:
+            e = np.array(remb, dtype=np.float32)
+            e_norm = e / (np.linalg.norm(e) + 1e-8)
+            sim = float(np.dot(q_norm, e_norm))
+            distance = 1.0 - sim
+            scored.append((distance, [rid, rtext, rmeta, rcreated, rupdated]))
+        scored.sort(key=lambda x: x[0])
+        return [row for _, row in scored[:top_k]]
+
+    def _list_symbols(self, grammar: str) -> list[str]:
+        """Return the names of all symbols under a grammar, alphabetically sorted."""
+        try:
+            result = self._conn.execute(
+                "MATCH (s:Symbol) WHERE s.grammar = $g RETURN s.name ORDER BY s.name",
+                {"g": grammar},
+            )
+            return [row[0] for row in result.get_all()]
+        except Exception:
+            return []
+
+    def _count_rules(self, grammar: str, symbol: str) -> int:
+        """Return the number of rules under (grammar, symbol). Zero if missing."""
+        try:
+            result = self._conn.execute(
+                "MATCH (r:Rule) WHERE r.grammar = $g AND r.symbol = $s RETURN count(r)",
+                {"g": grammar, "s": symbol},
+            )
+            db_rows = result.get_all()
+            return int(db_rows[0][0]) if db_rows else 0
+        except Exception:
+            return 0
+
     async def upsert_grammar(self, name: str, grammar: Grammar, embedder: Embedder) -> None:
         """Import a Grammar object into the DB. Embeds all expansions.
 
