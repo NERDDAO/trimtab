@@ -1,0 +1,41 @@
+digraph trimtab_data_flow {
+    rankdir=TB;
+    node [fontname="Inter, sans-serif", fontsize=11];
+    edge [fontname="Inter, sans-serif", fontsize=10];
+
+    // Write path
+    subgraph cluster_write {
+        label="Write path — one inbound route";
+        style=dashed; color="#888";
+        put [label="put(grammar, symbol, text, metadata)", shape=box, style=filled, fillcolor="#cde"];
+        embedder [label="Embedder\n(Ollama default)", shape=box, style=filled, fillcolor="#ffd"];
+        put -> embedder [label="text"];
+    }
+
+    // Storage
+    subgraph cluster_db {
+        label="LadybugDB";
+        style=filled; fillcolor="#f6f6f6";
+        grammar [label="Grammar\n{name}", shape=box];
+        symbol  [label="Symbol\n{name, grammar}", shape=box];
+        rule    [label="Rule\n{text, metadata, embedding,\ncreated_at, updated_at}", shape=box, style=filled, fillcolor="#efe"];
+        grammar -> symbol [label="HAS_SYMBOL"];
+        symbol  -> rule   [label="HAS_RULE"];
+    }
+
+    embedder -> rule [label="vector"];
+    put -> grammar [style=invis];
+
+    // Read paths
+    subgraph cluster_read {
+        label="Read paths";
+        style=dashed; color="#888";
+        list_r [label="list(g, s)\n— insertion-ordered", shape=box, style=filled, fillcolor="#ddf"];
+        search [label="search(g, s, query)\n— top-k cosine", shape=box, style=filled, fillcolor="#ddf"];
+        gen    [label="generate(g, context)\n— Tracery walk,\ncascading context", shape=box, style=filled, fillcolor="#ddf"];
+    }
+
+    rule -> list_r;
+    rule -> search;
+    rule -> gen;
+}
