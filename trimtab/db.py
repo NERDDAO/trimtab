@@ -33,23 +33,34 @@ class TrimTabDB:
         self._init_schema()
         self._init_vector_extension()
         self._embedding_dim: int | None = None
+        # Run v0.4 → v0.5 migration if the old schema is detected.
+        # Idempotent on fresh and already-migrated DBs.
+        from trimtab.migrations import run_migration
+        try:
+            run_migration(self._conn)
+        except Exception as e:
+            logger.warning("Migration attempt failed (non-fatal): %s", e)
+        # If a Rule table exists (fresh-after-migration or previously-used v0.5),
+        # probe its embedding dimension so subsequent puts respect it.
+        self._embedding_dim = self._probe_existing_rule_dim()
 
     def _init_schema(self) -> None:
-        """Create node and relationship tables if they don't exist."""
+        """Create v0.5 node and relationship tables if they don't exist."""
         self._conn.execute(
             "CREATE NODE TABLE IF NOT EXISTS Grammar(name STRING PRIMARY KEY)"
         )
         self._conn.execute(
-            "CREATE NODE TABLE IF NOT EXISTS Rule("
+            "CREATE NODE TABLE IF NOT EXISTS Symbol("
             "  id STRING PRIMARY KEY,"
             "  name STRING,"
             "  grammar STRING"
             ")"
         )
-        # Expansion table created lazily in _ensure_expansion_table when we know dimension.
         self._conn.execute(
-            "CREATE REL TABLE IF NOT EXISTS HAS_RULE(FROM Grammar TO Rule)"
+            "CREATE REL TABLE IF NOT EXISTS HAS_SYMBOL(FROM Grammar TO Symbol)"
         )
+        # Rule node table is created lazily in _ensure_rule_table when we
+        # know the embedding dimension. HAS_RULE edge is created alongside.
 
     def _init_vector_extension(self) -> None:
         """Load vector extension."""
@@ -61,6 +72,72 @@ class TrimTabDB:
             self._conn.execute("LOAD EXTENSION vector")
         except Exception:
             pass
+
+    def _probe_existing_rule_dim(self) -> int | None:
+        """Return the embedding dim of the Rule table if it exists, else None.
+
+        Called from __init__ after migration so we know the pinned dim
+        without forcing callers to re-supply it on every put.
+        """
+        try:
+            rows = self._conn.execute(
+                "MATCH (r:Rule) RETURN r.embedding LIMIT 1"
+            ).get_all()
+            if rows and rows[0][0]:
+                return len(rows[0][0])
+        except Exception:
+            pass
+        return None
+
+    def _ensure_rule_table(self, dim: int) -> None:
+        """Create the v0.5 Rule node table with the given embedding dim.
+
+        The Rule table is created lazily on first put so we can pin the
+        correct FLOAT[dim] column width. If the table already exists at a
+        different dim, raise TrimTabDimensionError — LadybugDB does not
+        allow changing a fixed-width array column after creation.
+        """
+        if self._embedding_dim == dim:
+            # Already created at this dim — no-op.
+            return
+        if self._embedding_dim is not None and self._embedding_dim != dim:
+            from trimtab.errors import TrimTabDimensionError
+            raise TrimTabDimensionError(expected=self._embedding_dim, got=dim)
+
+        # First-ever creation (fresh DB with no migration, no prior put).
+        try:
+            self._conn.execute(
+                f"CREATE NODE TABLE IF NOT EXISTS Rule("
+                f"  id STRING PRIMARY KEY,"
+                f"  text STRING,"
+                f"  grammar STRING,"
+                f"  symbol STRING,"
+                f"  metadata STRING,"
+                f"  embedding FLOAT[{dim}],"
+                f"  embedded BOOLEAN,"
+                f"  created_at STRING,"
+                f"  updated_at STRING"
+                f")"
+            )
+        except Exception:
+            pass
+        try:
+            self._conn.execute(
+                "CREATE REL TABLE IF NOT EXISTS HAS_RULE(FROM Symbol TO Rule)"
+            )
+        except Exception:
+            pass
+        # Create HNSW index on the embedding column.
+        try:
+            self._conn.execute(
+                "CALL CREATE_VECTOR_INDEX("
+                "  'Rule', 'rule_embedding_idx', 'embedding',"
+                "  metric := 'cosine'"
+                ")"
+            )
+        except Exception:
+            pass
+        self._embedding_dim = dim
 
     def _ensure_expansion_table(self, dim: int) -> None:
         """Create Expansion table and HNSW index with correct embedding dimension."""
@@ -141,6 +218,109 @@ class TrimTabDB:
                 "embedding": vec_list,
             },
         )
+
+    def _put_rule_with_vector(
+        self,
+        grammar: str,
+        symbol: str,
+        rule: "Rule",
+        vector: list[float],
+    ) -> "Rule":
+        """Insert a Rule into v0.5 tables. Vector must be pre-computed."""
+        import json
+        from trimtab.grammar import Rule as _Rule  # avoid import cycle
+
+        self._ensure_rule_table(len(vector))
+
+        # Ensure Grammar and Symbol nodes exist.
+        self._conn.execute(
+            "MERGE (g:Grammar {name: $name})",
+            {"name": grammar},
+        )
+        sym_id = f"{grammar}:{symbol}"
+        self._conn.execute(
+            "MERGE (s:Symbol {id: $id}) "
+            "ON CREATE SET s.name = $name, s.grammar = $grammar "
+            "ON MATCH SET s.name = $name",
+            {"id": sym_id, "name": symbol, "grammar": grammar},
+        )
+        self._conn.execute(
+            "MATCH (g:Grammar), (s:Symbol) "
+            "WHERE g.name = $gname AND s.id = $sid "
+            "MERGE (g)-[:HAS_SYMBOL]->(s)",
+            {"gname": grammar, "sid": sym_id},
+        )
+
+        # Delete-then-create pattern (vector-indexed columns reject SET).
+        try:
+            self._conn.execute(
+                "MATCH (r:Rule) WHERE r.id = $id DETACH DELETE r",
+                {"id": rule.id},
+            )
+        except Exception:
+            pass
+
+        # Serialize updated_at (may be None on construction if caller built
+        # a Rule with no updated_at override; __post_init__ normally fills it
+        # but defensive handling here too).
+        updated_at_iso = (
+            rule.updated_at.isoformat() if rule.updated_at is not None
+            else rule.created_at.isoformat()
+        )
+
+        self._conn.execute(
+            "CREATE (r:Rule {"
+            "  id: $id, text: $text, grammar: $grammar, symbol: $symbol,"
+            "  metadata: $metadata, embedding: $embedding, embedded: $embedded,"
+            "  created_at: $created_at, updated_at: $updated_at"
+            "})",
+            {
+                "id": rule.id,
+                "text": rule.text,
+                "grammar": grammar,
+                "symbol": symbol,
+                "metadata": json.dumps(json.dumps(rule.metadata)),
+                "embedding": vector,
+                "embedded": True,
+                "created_at": rule.created_at.isoformat(),
+                "updated_at": updated_at_iso,
+            },
+        )
+        self._conn.execute(
+            "MATCH (s:Symbol), (r:Rule) "
+            "WHERE s.id = $sid AND r.id = $rid "
+            "MERGE (s)-[:HAS_RULE]->(r)",
+            {"sid": sym_id, "rid": rule.id},
+        )
+        return rule
+
+    def _get_rules(self, grammar: str, symbol: str) -> list["Rule"]:
+        """Return all rules under (grammar, symbol), insertion-ordered by created_at."""
+        import json
+        from datetime import datetime
+        from trimtab.grammar import Rule as _Rule
+
+        result = self._conn.execute(
+            "MATCH (r:Rule) "
+            "WHERE r.grammar = $g AND r.symbol = $s "
+            "RETURN r.id, r.text, r.metadata, r.created_at, r.updated_at "
+            "ORDER BY r.created_at ASC",
+            {"g": grammar, "s": symbol},
+        )
+        rules: list[_Rule] = []
+        for row in result.get_all():
+            rid, rtext, rmeta, rcreated, rupdated = row
+            meta = json.loads(json.loads(rmeta)) if rmeta else {}
+            rules.append(
+                _Rule(
+                    text=rtext,
+                    id=rid,
+                    metadata=meta,
+                    created_at=datetime.fromisoformat(rcreated),
+                    updated_at=datetime.fromisoformat(rupdated),
+                )
+            )
+        return rules
 
     async def upsert_grammar(self, name: str, grammar: Grammar, embedder: Embedder) -> None:
         """Import a Grammar object into the DB. Embeds all expansions.
