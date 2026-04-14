@@ -284,12 +284,11 @@ class TrimTabDB:
                 "text": rule.text,
                 "grammar": grammar,
                 "symbol": symbol,
-                # LadybugDB auto-parses JSON-looking string values on write
-                # and re-serializes them as Cypher map literals, breaking
-                # json.loads on read. Double-encoding produces a string whose
-                # outer layer is opaque to LadybugDB's parser. Match the
-                # double-decode in _get_rules below.
-                "metadata": json.dumps(json.dumps(rule.metadata)),
+                # LadybugDB auto-parses string parameters that start with `{`
+                # and re-serializes them as Cypher map literals (unquoted keys),
+                # which breaks `json.loads` on read. The `"json:"` prefix
+                # bypasses that heuristic — read side strips it in _get_rules.
+                "metadata": "json:" + json.dumps(rule.metadata),
                 "embedding": vector,
                 "embedded": True,
                 "created_at": rule.created_at.isoformat(),
@@ -316,9 +315,9 @@ class TrimTabDB:
         rules: list[Rule] = []
         for row in result.get_all():
             rid, rtext, rmeta, rcreated, rupdated = row
-            # Double-decode — matches the double-encode in _put_rule_with_vector.
-            # See that method's comment for the LadybugDB rationale.
-            meta = json.loads(json.loads(rmeta)) if rmeta else {}
+            # Strip the "json:" prefix that _put_rule_with_vector adds to
+            # bypass LadybugDB's auto-parse on map-literal-shaped strings.
+            meta = json.loads(rmeta[5:]) if rmeta else {}
             rules.append(
                 Rule(
                     text=rtext,
