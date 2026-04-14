@@ -14,11 +14,11 @@ for advanced use.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from trimtab.db import TrimTabDB
 from trimtab.embedder import Embedder
-from trimtab.grammar import Rule
+from trimtab.grammar import Rule, upgrade_entry
 
 if TYPE_CHECKING:  # avoid eager OllamaEmbedder import at module load
     pass
@@ -49,6 +49,104 @@ class TrimTab:
         p = Path(path).expanduser()
         p.parent.mkdir(parents=True, exist_ok=True)
         return str(p)
+
+    # --- async writes ------------------------------------------------------
+
+    async def put(
+        self,
+        grammar: str,
+        symbol: str,
+        text: str,
+        metadata: dict[str, Any] | None = None,
+        id: str | None = None,
+    ) -> Rule:
+        """Insert a single rule. Always embeds before writing.
+
+        ``id`` defaults to an auto-generated ``r_<uuid>`` if not supplied.
+        ``metadata`` defaults to ``{}``. Returns the inserted ``Rule`` object
+        with all fields populated (including the auto-id and timestamps).
+        """
+        rule = Rule(text=text, id=id or "", metadata=metadata or {})
+        vector = await self._embedder.create(text)
+        return self._db._put_rule_with_vector(
+            grammar=grammar,
+            symbol=symbol,
+            rule=rule,
+            vector=vector,
+        )
+
+    async def put_many(
+        self,
+        grammar: str,
+        symbol: str,
+        entries: list[dict[str, Any] | str],
+    ) -> list[Rule]:
+        """Bulk insert — one embedder.create_batch call for the whole batch.
+
+        ``entries`` accepts a mix of plain strings (each becomes ``Rule(text=...)``)
+        and ``{"text": ..., "id"?: ..., "metadata"?: ...}`` dicts. ``upgrade_entry``
+        normalizes both shapes to ``Rule`` objects.
+
+        Empty input returns an empty list without calling the embedder.
+        """
+        if not entries:
+            return []
+
+        rules = [upgrade_entry(e) for e in entries]
+        texts = [r.text for r in rules]
+        vectors = await self._embedder.create_batch(texts)
+
+        written: list[Rule] = []
+        for rule, vec in zip(rules, vectors, strict=True):
+            written.append(
+                self._db._put_rule_with_vector(
+                    grammar=grammar,
+                    symbol=symbol,
+                    rule=rule,
+                    vector=vec,
+                )
+            )
+        return written
+
+    async def update(
+        self,
+        grammar: str,
+        symbol: str,
+        rule_id: str,
+        text: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Update a rule by id. Re-embeds only if ``text`` is provided.
+
+        ``metadata`` is merged into the existing dict (new keys added,
+        existing keys overwritten). Pass ``None`` (the default) to leave
+        metadata alone.
+
+        Raises ``TrimTabNotFoundError`` if no rule with ``rule_id`` exists
+        under (grammar, symbol).
+        """
+        from trimtab.errors import TrimTabNotFoundError
+
+        new_vector: list[float] | None = None
+        if text is not None:
+            new_vector = await self._embedder.create(text)
+        try:
+            self._db._update_rule_fields(
+                grammar=grammar,
+                symbol=symbol,
+                rule_id=rule_id,
+                text=text,
+                metadata=metadata,
+                new_vector=new_vector,
+            )
+        except RuntimeError as exc:
+            # LadybugDB raises RuntimeError("Table Rule does not exist") when
+            # no rules have ever been written — treat as not-found.
+            if "does not exist" in str(exc):
+                raise TrimTabNotFoundError(
+                    grammar=grammar, symbol=symbol, rule_id=rule_id
+                ) from exc
+            raise
 
     # --- sync read / introspection ------------------------------------------
 

@@ -94,3 +94,82 @@ def test_drop_via_facade(tt, stub_embedder):
     tt.drop("g1")
     assert tt.list_symbols("g1") == []
     assert tt.list_grammars() == []
+
+
+@pytest.mark.asyncio
+async def test_put_embeds_and_stores(tt):
+    r = await tt.put(
+        grammar="g1", symbol="friends",
+        text="Alice — party wizard",
+        metadata={"rank": 1},
+    )
+    assert isinstance(r, Rule)
+    assert r.text == "Alice — party wizard"
+    assert r.metadata == {"rank": 1}
+    assert r.id  # auto-assigned
+
+    listed = tt.list("g1", "friends")
+    assert len(listed) == 1
+    assert listed[0].text == "Alice — party wizard"
+
+
+@pytest.mark.asyncio
+async def test_put_accepts_caller_id(tt):
+    r = await tt.put("g1", "friends", "Bob", id="ent_bob")
+    assert r.id == "ent_bob"
+
+
+@pytest.mark.asyncio
+async def test_put_many_batches_one_embed_call(tt, stub_embedder):
+    before = stub_embedder.batch_call_count
+    rules = await tt.put_many(
+        grammar="g1", symbol="notes",
+        entries=[
+            {"text": "first note"},
+            {"text": "second note", "metadata": {"source": "overheard"}},
+        ],
+    )
+    assert stub_embedder.batch_call_count == before + 1
+    assert len(rules) == 2
+    listed = tt.list("g1", "notes")
+    assert len(listed) == 2
+    # Metadata round-trip on the second entry.
+    by_text = {r.text: r for r in listed}
+    assert by_text["second note"].metadata == {"source": "overheard"}
+
+
+@pytest.mark.asyncio
+async def test_put_many_empty_returns_empty(tt, stub_embedder):
+    before = stub_embedder.batch_call_count
+    rules = await tt.put_many(grammar="g1", symbol="notes", entries=[])
+    assert rules == []
+    # No embed call for empty input.
+    assert stub_embedder.batch_call_count == before
+
+
+@pytest.mark.asyncio
+async def test_update_metadata_does_not_reembed(tt, stub_embedder):
+    r = await tt.put("g1", "friends", "Alice")
+    before = stub_embedder.call_count
+    await tt.update("g1", "friends", r.id, metadata={"rank": 99})
+    # No new single-embed call (text unchanged).
+    assert stub_embedder.call_count == before
+    listed = tt.list("g1", "friends")
+    assert listed[0].metadata == {"rank": 99}
+
+
+@pytest.mark.asyncio
+async def test_update_text_reembeds(tt, stub_embedder):
+    r = await tt.put("g1", "friends", "Alice")
+    before = stub_embedder.call_count
+    await tt.update("g1", "friends", r.id, text="Alice the Wizard")
+    assert stub_embedder.call_count == before + 1
+    listed = tt.list("g1", "friends")
+    assert listed[0].text == "Alice the Wizard"
+
+
+@pytest.mark.asyncio
+async def test_update_unknown_id_raises(tt):
+    from trimtab.errors import TrimTabNotFoundError
+    with pytest.raises(TrimTabNotFoundError):
+        await tt.update("g1", "friends", "nope", text="x")
