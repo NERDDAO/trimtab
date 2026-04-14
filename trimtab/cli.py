@@ -118,8 +118,18 @@ async def cmd_export(args):
 async def cmd_put(args):
     """Insert a rule into a grammar/symbol."""
     from trimtab.core import TrimTab
+    metadata = None
+    if args.metadata:
+        try:
+            metadata = json.loads(args.metadata)
+        except json.JSONDecodeError as e:
+            print(
+                f"error: --metadata must be valid JSON ({e.msg} at char {e.pos}). "
+                f"Example: --metadata '{{\"rank\": 1, \"tags\": [\"a\", \"b\"]}}'",
+                file=sys.stderr,
+            )
+            return 2
     tt = TrimTab(path=args.db or DEFAULT_DB, embedder=_get_embedder())
-    metadata = json.loads(args.metadata) if args.metadata else None
     rule = await tt.put(
         grammar=args.grammar,
         symbol=args.symbol,
