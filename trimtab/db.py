@@ -151,86 +151,6 @@ class TrimTabDB:
             logger.debug("HNSW index creation (likely already exists): %s", e)
         self._embedding_dim = dim
 
-    def _ensure_expansion_table(self, dim: int) -> None:
-        """Create Expansion table and HNSW index with correct embedding dimension."""
-        if self._embedding_dim == dim:
-            return
-
-        if self._embedding_dim is not None and self._embedding_dim != dim:
-            # Dimension changed — need to recreate
-            try:
-                self._conn.execute("DROP TABLE IF EXISTS HAS_EXPANSION")
-            except Exception:
-                pass
-            try:
-                self._conn.execute("DROP TABLE IF EXISTS Expansion")
-            except Exception:
-                pass
-
-        try:
-            self._conn.execute(
-                f"CREATE NODE TABLE IF NOT EXISTS Expansion("
-                f"  id STRING PRIMARY KEY,"
-                f"  text STRING,"
-                f"  rule_id STRING,"
-                f"  grammar STRING,"
-                f"  embedding FLOAT[{dim}]"
-                f")"
-            )
-        except Exception:
-            pass  # already exists
-
-        try:
-            self._conn.execute(
-                "CREATE REL TABLE IF NOT EXISTS HAS_EXPANSION(FROM Rule TO Expansion)"
-            )
-        except Exception:
-            pass
-
-        self._embedding_dim = dim
-
-    def _ensure_hnsw_index(self) -> None:
-        """Create HNSW index if it doesn't exist yet."""
-        try:
-            self._conn.execute(
-                "CALL CREATE_VECTOR_INDEX("
-                "  'Expansion', 'expansion_embedding_idx', 'embedding',"
-                "  metric := 'cosine'"
-                ")"
-            )
-        except Exception:
-            pass  # index may already exist
-
-    def _upsert_expansion(
-        self, exp_id: str, text: str, rule_id: str, grammar: str, vec_list: list
-    ) -> None:
-        """Insert or replace an expansion node.
-
-        LadybugDB forbids MERGE/SET on columns covered by a vector index,
-        so we DETACH DELETE the old node (if any) then CREATE a fresh one.
-        """
-        try:
-            self._conn.execute(
-                "MATCH (e:Expansion) WHERE e.id = $id DETACH DELETE e",
-                {"id": exp_id},
-            )
-        except Exception:
-            pass  # node may not exist
-
-        self._conn.execute(
-            "CREATE (e:Expansion {"
-            "  id: $id, text: $text, rule_id: $rule_id,"
-            "  grammar: $grammar, embedding: $embedding"
-            "})",
-            {
-                "id": exp_id,
-                "text": text,
-                "rule_id": rule_id,
-                "grammar": grammar,
-                "embedding": vec_list,
-            },
-        )
-
     def _put_rule_with_vector(
         self,
         grammar: str,
@@ -554,118 +474,84 @@ class TrimTabDB:
             return 0
 
     async def upsert_grammar(self, name: str, grammar: Grammar, embedder: Embedder) -> None:
-        """Import a Grammar object into the DB. Embeds all expansions.
+        """DEPRECATED. Use TrimTab.load_file or TrimTab.put per entry.
 
-        Honors explicit expansion ids when the grammar supplies them (via
-        ``{"text", "id"}`` dict entries in ``Grammar.rules``). Expansions
-        with no explicit id fall back to the auto-generated
-        ``{name}:{rule_name}:{hash(text)}`` shape.
-
-        Args:
-            name: Grammar name (e.g., "dev-memory", "narrator").
-            grammar: Grammar object with rules and expansions.
-            embedder: Async embedder (graphiti_core EmbedderClient or any
-                Protocol-compatible object with ``create`` / ``create_batch``).
+        Bulk-loads a Grammar by embedding all entries and writing them
+        through the v0.5 _put_rule_with_vector path.
         """
-        # Probe embedding dimension so we can create the fixed-width table.
-        probe = await embedder.create("dimension probe")
-        self._ensure_expansion_table(len(probe))
+        import warnings
+        from trimtab.grammar import upgrade_entry
 
-        # Create grammar node
-        self._conn.execute(
-            "MERGE (g:Grammar {name: $name})",
-            {"name": name},
+        warnings.warn(
+            "TrimTabDB.upsert_grammar is deprecated. Use TrimTab.load_file() "
+            "or TrimTab.put() per rule in v0.5.",
+            DeprecationWarning,
+            stacklevel=2,
         )
 
-        for rule_name in grammar.rule_names():
-            rule_id = f"{name}:{rule_name}"
+        # Collect all entries across all symbols for one batch embed.
+        all_items: list[tuple[str, Rule]] = []  # (symbol_name, Rule)
+        for symbol_name in grammar.rule_names():
+            for entry in grammar.rules.get(symbol_name, []):
+                rule_obj = upgrade_entry(entry)
+                all_items.append((symbol_name, rule_obj))
 
-            # Create rule node
-            self._conn.execute(
-                "MERGE (r:Rule {id: $id}) ON CREATE SET r.name = $name, r.grammar = $grammar "
-                "ON MATCH SET r.name = $name, r.grammar = $grammar",
-                {"id": rule_id, "name": rule_name, "grammar": name},
+        if not all_items:
+            return
+
+        texts = [r.text for _, r in all_items]
+        vectors = await embedder.create_batch(texts)
+        for (symbol_name, rule_obj), vec in zip(all_items, vectors, strict=True):
+            self._put_rule_with_vector(
+                grammar=name,
+                symbol=symbol_name,
+                rule=rule_obj,
+                vector=vec,
             )
-
-            # Create HAS_RULE edge
-            self._conn.execute(
-                "MATCH (g:Grammar), (r:Rule) "
-                "WHERE g.name = $gname AND r.id = $rid "
-                "MERGE (g)-[:HAS_RULE]->(r)",
-                {"gname": name, "rid": rule_id},
-            )
-
-            # Insert expansions — honor consumer-supplied ids when present.
-            expansion_items = grammar.get_expansion_items(rule_name)
-            if not expansion_items:
-                continue
-
-            texts = [text for text, _ in expansion_items]
-            vectors = await embedder.create_batch(texts)
-
-            for (text, explicit_id), vec in zip(expansion_items, vectors, strict=True):
-                exp_id = explicit_id if explicit_id else f"{name}:{rule_name}:{hash(text)}"
-                self._upsert_expansion(exp_id, text, rule_id, name, vec)
-
-                # Create HAS_EXPANSION edge
-                self._conn.execute(
-                    "MATCH (r:Rule), (e:Expansion) "
-                    "WHERE r.id = $rid AND e.id = $eid "
-                    "MERGE (r)-[:HAS_EXPANSION]->(e)",
-                    {"rid": rule_id, "eid": exp_id},
-                )
-
-        # Create HNSW index after all data is inserted (avoids the MERGE/SET
-        # restriction on indexed columns during bulk load).
-        self._ensure_hnsw_index()
 
         logger.info("Upserted grammar '%s' with %d rules", name, len(grammar.rule_names()))
 
     async def register_grammar(self, name: str, grammar: Grammar, embedder: Embedder) -> None:
-        """Register a grammar's rule structure without embedding expansions.
+        """DEPRECATED. In v0.5, symbols are created lazily on first put.
 
-        Use this when expansion vectors will be added separately via
-        ``add_expansion`` with precomputed embeddings — for example, when
-        loading from a cache of previously-embedded text. Creates the
-        Grammar node, Rule nodes, and HAS_RULE edges. Does not create
-        Expansion nodes.
-
-        The embedder is only used to probe the vector dimension if this is
-        the first grammar being registered on this DB instance. Subsequent
-        calls reuse the cached dimension and make zero embedder calls.
-
-        Args:
-            name: Grammar name (e.g. "bonfire123:applicant_review").
-            grammar: Grammar object with rule structure.
-            embedder: Async embedder (only used for the one-shot dim probe).
+        Probes the embedder dimension and creates Grammar + Symbol nodes
+        for each rule_name in the grammar, but does not insert any
+        Rule entries (no embedding cost). Mostly preserved for callers
+        that want to pre-create the structure.
         """
-        if self._embedding_dim is None:
-            probe = await embedder.create("dimension probe")
-            self._ensure_expansion_table(len(probe))
+        import warnings
 
-        self._conn.execute(
-            "MERGE (g:Grammar {name: $name})",
-            {"name": name},
+        warnings.warn(
+            "TrimTabDB.register_grammar is deprecated. In v0.5, symbols are "
+            "created lazily on the first TrimTab.put() call.",
+            DeprecationWarning,
+            stacklevel=2,
         )
 
-        for rule_name in grammar.rule_names():
-            rule_id = f"{name}:{rule_name}"
-            self._conn.execute(
-                "MERGE (r:Rule {id: $id}) ON CREATE SET r.name = $name, r.grammar = $grammar "
-                "ON MATCH SET r.name = $name, r.grammar = $grammar",
-                {"id": rule_id, "name": rule_name, "grammar": name},
-            )
-            self._conn.execute(
-                "MATCH (g:Grammar), (r:Rule) "
-                "WHERE g.name = $gname AND r.id = $rid "
-                "MERGE (g)-[:HAS_RULE]->(r)",
-                {"gname": name, "rid": rule_id},
-            )
+        # Probe dimension via a single embed call so _ensure_rule_table can fire.
+        probe = await embedder.create("dimension probe")
+        self._ensure_rule_table(len(probe))
 
-        self._ensure_hnsw_index()
+        # Create Grammar + Symbol nodes (no rules).
+        self._conn.execute(
+            "MERGE (g:Grammar {name: $name})", {"name": name},
+        )
+        for sym_name in grammar.rule_names():
+            sym_id = f"{name}:{sym_name}"
+            self._conn.execute(
+                "MERGE (s:Symbol {id: $id}) "
+                "ON CREATE SET s.name = $n, s.grammar = $g",
+                {"id": sym_id, "n": sym_name, "g": name},
+            )
+            self._conn.execute(
+                "MATCH (g:Grammar), (s:Symbol) "
+                "WHERE g.name = $gname AND s.id = $sid "
+                "MERGE (g)-[:HAS_SYMBOL]->(s)",
+                {"gname": name, "sid": sym_id},
+            )
 
         logger.info(
-            "Registered grammar '%s' with %d rules (no embeddings)",
+            "Registered grammar '%s' with %d symbols (no rules)",
             name,
             len(grammar.rule_names()),
         )
@@ -673,161 +559,94 @@ class TrimTabDB:
     def add_expansion(
         self,
         grammar: str,
-        rule: str,
+        rule: str,  # in v0.4 this was the rule (now called symbol)
         text: str,
         embedding: list[float],
         id: str | None = None,
     ) -> None:
-        """Add a single expansion with its embedding vector.
+        """DEPRECATED. Use TrimTab.put() in v0.5.
 
-        Args:
-            grammar: Grammar name.
-            rule: Rule name within the grammar.
-            text: Expansion text.
-            embedding: Pre-computed embedding vector (list of floats, as
-                produced by an embedder's ``create(text)`` method).
-            id: Optional custom Expansion id. If None, auto-generates
-                "{grammar}:{rule}:{hash(text)}". Set this to associate the
-                expansion with an external entity (e.g., a KG entity UUID).
+        Note: the v0.4 ``rule`` parameter maps to the v0.5 ``symbol`` concept.
+        What v0.4 called an "expansion" is now called a "rule".
         """
-        rule_id = f"{grammar}:{rule}"
-        exp_id = id if id is not None else f"{grammar}:{rule}:{hash(text)}"
+        import warnings
 
-        # Ensure rule exists
-        self._conn.execute(
-            "MERGE (r:Rule {id: $id}) ON CREATE SET r.name = $name, r.grammar = $grammar "
-            "ON MATCH SET r.name = $name",
-            {"id": rule_id, "name": rule, "grammar": grammar},
+        warnings.warn(
+            "TrimTabDB.add_expansion is deprecated. In v0.5, use TrimTab.put(). "
+            "The 'rule' parameter here maps to the new 'symbol' concept; what "
+            "v0.4 called an 'expansion' is now called a 'rule'.",
+            DeprecationWarning,
+            stacklevel=2,
         )
-
-        # Insert expansion (delete+create to work with vector index)
-        self._upsert_expansion(exp_id, text, rule_id, grammar, embedding)
-
-        # Create HAS_EXPANSION edge
-        self._conn.execute(
-            "MATCH (r:Rule), (e:Expansion) "
-            "WHERE r.id = $rid AND e.id = $eid "
-            "MERGE (r)-[:HAS_EXPANSION]->(e)",
-            {"rid": rule_id, "eid": exp_id},
+        rule_obj = Rule(text=text, id=id or "")
+        self._put_rule_with_vector(
+            grammar=grammar,
+            symbol=rule,
+            rule=rule_obj,
+            vector=embedding,
         )
 
     def query(
-        self, grammar: str, rule: str, vector: list[float], top_k: int = 5
+        self,
+        grammar: str,
+        rule: str,
+        vector: list[float],
+        top_k: int = 5,
     ) -> list[tuple[str, float, str]]:
-        """Vector similarity search within a specific rule's expansions.
+        """DEPRECATED. Use TrimTab.search() which returns full Rule objects.
 
-        Args:
-            grammar: Grammar name.
-            rule: Rule name.
-            vector: Query embedding (list of floats from embedder.create()).
-            top_k: Number of results to return.
-
-        Returns list of (text, score, id) tuples sorted by relevance (highest first).
-        Score is cosine similarity (higher = more similar).
-        The id is the Expansion.id — auto-generated by default, or consumer-provided
-        via add_expansion(id=...).
+        Returns the v0.4 tuple shape: list of (text, score, id) tuples.
+        Score is a placeholder 1.0 because _search_rules doesn't surface
+        the cosine distance — for real scores, use the new TrimTab.search.
         """
-        rule_id = f"{grammar}:{rule}"
+        import warnings
 
-        try:
-            result = self._conn.execute(
-                "CALL QUERY_VECTOR_INDEX('Expansion', 'expansion_embedding_idx', $vec, $k) "
-                "WHERE node.rule_id = $rule_id "
-                "RETURN node.text, distance, node.id "
-                "ORDER BY distance",
-                {"vec": vector, "k": top_k * 4, "rule_id": rule_id},
-            )
-            rows = result.get_all()
-        except Exception:
-            rows = []
-
-        # Fall back to brute force if HNSW returned nothing.
-        # New nodes added after _ensure_hnsw_index() may not be indexed yet,
-        # so empty HNSW results don't necessarily mean no matching data.
-        if not rows:
-            rows = self._brute_force_query(rule_id, vector, top_k)
-
-        results = []
-        for row in rows[:top_k]:
-            text = row[0]
-            distance = float(row[1])
-            score = 1.0 - distance
-            exp_id = row[2] if len(row) > 2 else ""
-            results.append((text, score, exp_id))
-
-        return results
-
-    def _brute_force_query(
-        self, rule_id: str, vector: list[float], top_k: int
-    ) -> list[list]:
-        """Fallback: fetch all expansions for rule and compute cosine similarity."""
-        result = self._conn.execute(
-            "MATCH (e:Expansion) WHERE e.rule_id = $rule_id "
-            "RETURN e.text, e.embedding, e.id",
-            {"rule_id": rule_id},
+        warnings.warn(
+            "TrimTabDB.query is deprecated. Use TrimTab.search() which returns "
+            "full Rule objects including metadata.",
+            DeprecationWarning,
+            stacklevel=2,
         )
-        rows = result.get_all()
-        if not rows:
-            return []
-
-        query_arr = np.array(vector, dtype=np.float32)
-        vec_norm = query_arr / (np.linalg.norm(query_arr) + 1e-8)
-        scored = []
-        for text, emb, exp_id in rows:
-            emb_arr = np.array(emb, dtype=np.float32)
-            emb_norm = emb_arr / (np.linalg.norm(emb_arr) + 1e-8)
-            sim = float(np.dot(vec_norm, emb_norm))
-            distance = 1.0 - sim
-            scored.append([text, distance, exp_id or ""])
-
-        scored.sort(key=lambda x: x[1])
-        return scored[:top_k]
+        rules = self._search_rules(
+            grammar=grammar, symbol=rule, query_vector=vector, top_k=top_k,
+        )
+        return [(r.text, 1.0, r.id) for r in rules]
 
     def get_grammar(self, name: str) -> Grammar:
         """Export a grammar from the DB back to a Grammar object.
 
-        Returns expansions as plain text strings (the round-trip shape).
-        To also get expansion ids, use ``get_expansions_with_ids``.
+        v0.5: reads from the new Symbol → Rule schema and reconstructs a
+        Grammar dict. Returns rules as plain text strings (the round-trip
+        compatible shape).
         """
         from trimtab.grammar import ExpansionEntry
 
-        result = self._conn.execute(
-            "MATCH (r:Rule) WHERE r.grammar = $grammar RETURN r.name",
-            {"grammar": name},
-        )
         rules: dict[str, list[ExpansionEntry]] = {}
-        for row in result.get_all():
-            rule_name = row[0]
-            rules[rule_name] = list(self.get_expansions(name, rule_name))
+        for sym_name in self._list_symbols(name):
+            rule_objs = self._get_rules(name, sym_name)
+            rules[sym_name] = [r.text for r in rule_objs]
         return Grammar(rules=rules)
 
     def get_expansions(self, grammar: str, rule: str) -> list[str]:
-        """Get all expansion texts for a specific rule."""
-        rule_id = f"{grammar}:{rule}"
-        result = self._conn.execute(
-            "MATCH (e:Expansion) WHERE e.rule_id = $rule_id RETURN e.text",
-            {"rule_id": rule_id},
+        """DEPRECATED. Use TrimTab.list() which returns full Rule objects."""
+        import warnings
+
+        warnings.warn(
+            "TrimTabDB.get_expansions is deprecated. Use TrimTab.list().",
+            DeprecationWarning, stacklevel=2,
         )
-        return [row[0] for row in result.get_all()]
+        return [r.text for r in self._get_rules(grammar, rule)]
 
     def list_entries(self, grammar: str, rule: str) -> list[tuple[str, str]]:
-        """List all (text, id) pairs for a rule — the store-read mode.
+        """DEPRECATED. Use TrimTab.list() which returns full Rule objects."""
+        import warnings
 
-        Unlike ``query`` (which does embedding similarity search), this returns
-        every expansion in the rule with no ranking or filtering. Use this when
-        you want to treat a rule as a flat table rather than a search index.
-
-        Returns:
-            List of ``(text, id)`` tuples. The id is the consumer-supplied
-            expansion id (e.g., a KG entity UUID or path-tagged string), or
-            the auto-generated ``{grammar}:{rule}:{hash}`` if none was set.
-        """
-        rule_id = f"{grammar}:{rule}"
-        result = self._conn.execute(
-            "MATCH (e:Expansion) WHERE e.rule_id = $rule_id RETURN e.text, e.id",
-            {"rule_id": rule_id},
+        warnings.warn(
+            "TrimTabDB.list_entries is deprecated. Use TrimTab.list() which "
+            "returns Rule objects including metadata.",
+            DeprecationWarning, stacklevel=2,
         )
-        return [(row[0], row[1]) for row in result.get_all()]
+        return [(r.text, r.id) for r in self._get_rules(grammar, rule)]
 
     def list_grammars(self) -> list[str]:
         """List all grammar names in the DB."""
