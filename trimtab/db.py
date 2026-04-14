@@ -9,18 +9,26 @@ import numpy as np
 import real_ladybug as lb
 
 from trimtab.embedder import Embedder
-from trimtab.grammar import Grammar
+from trimtab.grammar import Grammar, Rule
 
 logger = logging.getLogger(__name__)
 
 
 class TrimTabDB:
-    """LadybugDB-backed storage for grammars, rules, and vector-indexed expansions.
+    """LadybugDB-backed storage for grammars, symbols, and vector-indexed rules.
 
-    Graph schema::
+    v0.5 graph schema::
 
-        (:Grammar {name}) -[:HAS_RULE]-> (:Rule {id, name, grammar})
-            -[:HAS_EXPANSION]-> (:Expansion {id, text, rule_id, grammar, embedding})
+        (:Grammar {name}) -[:HAS_SYMBOL]-> (:Symbol {id, name, grammar})
+            -[:HAS_RULE]-> (:Rule {
+                id, text, grammar, symbol, metadata, embedding,
+                embedded, created_at, updated_at
+            })
+
+    On first open, the v0.4 → v0.5 migration runs automatically and is
+    idempotent. Old v0.4 methods (``upsert_grammar``, ``add_expansion``,
+    ``query``, ``get_expansions``, ``list_entries``) still exist for one
+    release — they will be rewritten as deprecated shims in a later task.
 
     Args:
         path: Database path. Use ":memory:" for in-memory (tests/ephemeral),
@@ -223,12 +231,11 @@ class TrimTabDB:
         self,
         grammar: str,
         symbol: str,
-        rule: "Rule",
+        rule: Rule,
         vector: list[float],
-    ) -> "Rule":
+    ) -> Rule:
         """Insert a Rule into v0.5 tables. Vector must be pre-computed."""
         import json
-        from trimtab.grammar import Rule as _Rule  # avoid import cycle
 
         self._ensure_rule_table(len(vector))
 
@@ -294,11 +301,10 @@ class TrimTabDB:
         )
         return rule
 
-    def _get_rules(self, grammar: str, symbol: str) -> list["Rule"]:
+    def _get_rules(self, grammar: str, symbol: str) -> list[Rule]:
         """Return all rules under (grammar, symbol), insertion-ordered by created_at."""
         import json
         from datetime import datetime
-        from trimtab.grammar import Rule as _Rule
 
         result = self._conn.execute(
             "MATCH (r:Rule) "
@@ -307,12 +313,12 @@ class TrimTabDB:
             "ORDER BY r.created_at ASC",
             {"g": grammar, "s": symbol},
         )
-        rules: list[_Rule] = []
+        rules: list[Rule] = []
         for row in result.get_all():
             rid, rtext, rmeta, rcreated, rupdated = row
             meta = json.loads(json.loads(rmeta)) if rmeta else {}
             rules.append(
-                _Rule(
+                Rule(
                     text=rtext,
                     id=rid,
                     metadata=meta,
