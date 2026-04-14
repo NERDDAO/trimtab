@@ -29,3 +29,6 @@ stubPath = "typestubs"
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
+markers = [
+    "integration_ollama: tests that call a live Ollama (skipped by default)",
+]
