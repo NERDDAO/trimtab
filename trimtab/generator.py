@@ -4,8 +4,6 @@ import logging
 import random
 from typing import NamedTuple
 
-import numpy as np
-
 from trimtab.grammar import Grammar
 from trimtab.embedder import Embedder
 
@@ -70,13 +68,14 @@ class Generator:
         """
         rng = random.Random(seed)
         text, ids = await self._expand(
-            origin, context, temperature, rng, top_k, min_confidence, no_match_text, depth=0
+            origin, context, temperature, rng, top_k,
+            min_confidence, no_match_text, depth=0, visit_stack=[],
         )
         return GenerationResult(text=text, ids=ids)
 
     async def _expand(
         self,
-        rule: str,
+        rule: str,  # In v0.5 terminology this is a SYMBOL name
         context: str,
         temperature: float,
         rng: random.Random,
@@ -84,19 +83,30 @@ class Generator:
         min_confidence: float,
         no_match_text: str,
         depth: int,
+        visit_stack: list[str] | None = None,
     ) -> tuple[str, list[str]]:
-        """Recursively expand a rule with cascading context.
+        """Recursively expand a symbol with cascading context.
 
-        Returns ``(expanded_text, ids)`` where ``ids`` is the flat list of
-        expansion ids picked at this level and every level below (in walk
-        order).
+        ``visit_stack`` tracks the chain of symbols currently being expanded.
+        Re-entering a symbol already on the stack raises ``TrimTabCycleError``.
+        ``depth`` is a safety guard for pathological-but-acyclic grammars.
         """
-        if depth > 20:
+        from trimtab.errors import TrimTabCycleError
+
+        visit_stack = list(visit_stack or [])
+        if rule in visit_stack:
+            raise TrimTabCycleError(chain=visit_stack + [rule])
+        visit_stack.append(rule)
+
+        if depth > 50:
+            # Acyclic but pathologically deep — bail with a placeholder.
             return f"[{rule}]", []
 
-        expansions = self._db.get_expansions(self._grammar, rule)
-        if not expansions:
+        # Fetch rules via the new v0.5 path (was: self._db.get_expansions).
+        rule_objs = self._db._get_rules(self._grammar, rule)
+        if not rule_objs:
             return f"[{rule}]", []
+        expansions = [r.text for r in rule_objs]
 
         chosen_text, chosen_id = await self._select(
             rule, context, expansions, temperature, rng, top_k, min_confidence, no_match_text
@@ -109,7 +119,15 @@ class Generator:
         for ref in refs:
             cascaded_context = f"{context} {result}" if context else result
             sub_text, sub_ids = await self._expand(
-                ref, cascaded_context, temperature, rng, top_k, min_confidence, no_match_text, depth + 1
+                ref,
+                cascaded_context,
+                temperature,
+                rng,
+                top_k,
+                min_confidence,
+                no_match_text,
+                depth + 1,
+                visit_stack=visit_stack,
             )
             result = result.replace(f"#{ref}#", sub_text, 1)
             walk_ids.extend(sub_ids)
@@ -135,15 +153,10 @@ class Generator:
         an empty id because we never touched the DB's id mapping.
         """
         if len(expansions) == 1:
-            # Single-expansion rule — we still need the id. Cheapest path is
-            # a top-1 vector query; a zero vector returns the single row.
-            try:
-                zero_vec = [0.0] * (self._embedding_dim_hint() or 1)
-                candidates = self._db.query(self._grammar, rule, zero_vec, top_k=1)
-                if candidates:
-                    return candidates[0][0], candidates[0][2]
-            except Exception:
-                pass
+            # Single-expansion symbol — fetch the rule directly to get its id.
+            rule_objs = self._db._get_rules(self._grammar, rule)
+            if rule_objs:
+                return rule_objs[0].text, rule_objs[0].id
             return expansions[0], ""
 
         if temperature >= 1.0:
@@ -154,36 +167,25 @@ class Generator:
             return rng.choice(expansions), ""
 
         context_vec = await self._embedder.create(context)
-        candidates = self._db.query(self._grammar, rule, context_vec, top_k=top_k)
+        rule_objs = self._db._search_rules(self._grammar, rule, context_vec, top_k=top_k)
 
-        if not candidates:
+        if not rule_objs:
             if min_confidence > 0:
                 return no_match_text, ""
             return rng.choice(expansions), ""
 
-        best_score = candidates[0][1]
-        if min_confidence > 0 and best_score < min_confidence:
-            return no_match_text, ""
-
+        # Temperature == 0: top-1 (deterministic).
         if temperature <= 0.0:
-            return candidates[0][0], candidates[0][2]
+            return rule_objs[0].text, rule_objs[0].id
 
+        # Temperature > 0: uniform sample from the top-k. (Real weighted
+        # sampling by cosine score is a v0.6+ improvement — the new
+        # _search_rules doesn't surface scores.)
         if min_confidence > 0:
-            candidates = [(t, s, i) for t, s, i in candidates if s >= min_confidence]
-            if not candidates:
+            # Without scores we can't filter by confidence. Fall through to
+            # the no-match path if there's nothing to sample.
+            if not rule_objs:
                 return no_match_text, ""
 
-        texts = [c[0] for c in candidates]
-        ids = [c[2] for c in candidates]
-        scores = np.array([c[1] for c in candidates])
-
-        scores = scores - scores.min() + 1e-6
-        weights = np.exp(scores / temperature)
-        weights = weights / weights.sum()
-
-        idx = rng.choices(range(len(texts)), weights=weights.tolist(), k=1)[0]
-        return texts[idx], ids[idx]
-
-    def _embedding_dim_hint(self) -> int | None:
-        """Best-effort lookup of the DB's embedding dimension for zero-vector queries."""
-        return getattr(self._db, "_embedding_dim", None)
+        idx = rng.randrange(len(rule_objs))
+        return rule_objs[idx].text, rule_objs[idx].id
