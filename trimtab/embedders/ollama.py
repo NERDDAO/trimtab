@@ -45,6 +45,12 @@ class OllamaEmbedder:
             ) from e
 
     async def create(self, input_data: str | list[str]) -> list[float]:
+        """Embed a single text (or a list of texts joined with spaces).
+
+        When ``input_data`` is a list, this collapses the list into one string
+        with ``" ".join(...)`` and returns ONE embedding — not one embedding
+        per element. Use ``create_batch`` when you need per-element vectors.
+        """
         text = input_data if isinstance(input_data, str) else " ".join(input_data)
         try:
             resp = requests.post(
@@ -62,6 +68,7 @@ class OllamaEmbedder:
 
     async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
         try:
+            # Batches can be slower under load — double the single-embed timeout.
             resp = requests.post(
                 f"{self.base_url}/api/embed",
                 json={"model": self.model, "input": input_data_list},

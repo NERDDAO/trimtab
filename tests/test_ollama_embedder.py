@@ -71,6 +71,18 @@ async def test_create_raises_trimtab_error_on_http_failure():
             await emb.create("hello")
 
 
+@pytest.mark.asyncio
+async def test_create_batch_raises_trimtab_error_on_http_failure():
+    with patch("trimtab.embedders.ollama.requests") as req:
+        req.get.return_value = _mock_tags_ok()
+        bad = MagicMock()
+        bad.raise_for_status.side_effect = RuntimeError("500")
+        req.post.return_value = bad
+        emb = OllamaEmbedder(model="nomic-embed-text")
+        with pytest.raises(TrimTabEmbedderError):
+            await emb.create_batch(["a", "b"])
+
+
 @pytest.mark.integration_ollama
 @pytest.mark.asyncio
 async def test_live_ollama_contract():
