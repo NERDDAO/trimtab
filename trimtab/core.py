@@ -155,6 +155,31 @@ class TrimTab:
                 ) from exc
             raise
 
+    # --- async reads ----------------------------------------------------------
+
+    async def search(
+        self,
+        grammar: str,
+        symbol: str,
+        query: str,
+        top_k: int = 5,
+    ) -> list[Rule]:
+        """Semantic search within (grammar, symbol). Returns list[Rule].
+
+        Returns an empty list if the grammar or symbol is missing or has
+        no rules — absence is a valid answer for a memory store.
+        """
+        # Early-return on missing/empty symbol avoids a wasted embed call.
+        if self._db._count_rules(grammar, symbol) == 0:
+            return []
+        query_vector = await self._embedder.create(query)
+        return self._db._search_rules(
+            grammar=grammar,
+            symbol=symbol,
+            query_vector=query_vector,
+            top_k=top_k,
+        )
+
     # --- sync read / introspection ------------------------------------------
 
     def list(self, grammar: str, symbol: str) -> list[Rule]:
