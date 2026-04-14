@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trimtab"
-version = "0.4.0"
-description = "Context-aware grammar generation with cascading embedding search"
+version = "0.5.0"
+description = "Embedded memory and generation for agentic Python — Tracery-style grammars with semantic recall"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 dependencies = [
@@ -16,7 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 build = ["hdbscan>=0.8"]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
 
 [project.scripts]
 trimtab = "trimtab.cli:main"
@@ -26,3 +26,9 @@ where = ["."]
 
 [tool.pyright]
 stubPath = "typestubs"
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+markers = [
+    "integration_ollama: tests that call a live Ollama (skipped by default)",
+]

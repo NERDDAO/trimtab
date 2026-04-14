@@ -8,14 +8,17 @@ a single rule's expansion list.
 
 import json
 import re
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 _RULE_PATTERN = re.compile(r"#([\w\-]+)#")
 
-# An expansion is either plain text or {"text": ..., "id": ...}.
-ExpansionEntry = str | dict[str, str]
+# An expansion is either plain text or {"text": ..., "id": ..., "metadata": ...}.
+ExpansionEntry = str | dict[str, Any]  # {text, id?, metadata?}
 
 
 def _expansion_text(entry: ExpansionEntry) -> str:
@@ -30,6 +33,46 @@ def _expansion_id(entry: ExpansionEntry) -> str | None:
     if isinstance(entry, str):
         return None
     return entry.get("id") or None
+
+
+@dataclass
+class Rule:
+    """A single rule (individual expansion) under a symbol.
+
+    Tracery calls these "rules"; the old trimtab code called them
+    "expansions". Carries the text plus optional metadata, a stable id,
+    and timestamps.
+    """
+
+    text: str
+    id: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime | None = None  # filled in __post_init__
+
+    def __post_init__(self) -> None:
+        if not self.id:
+            self.id = f"r_{uuid.uuid4().hex}"
+        if self.updated_at is None:
+            self.updated_at = self.created_at
+
+
+def upgrade_entry(entry: "ExpansionEntry | Rule") -> Rule:
+    """Upgrade any legal entry shape to a Rule.
+
+    Accepts plain strings, ``{"text", "id"}`` dicts, ``{"text", "id", "metadata"}``
+    dicts, and already-constructed ``Rule`` objects (idempotent).
+    """
+    if isinstance(entry, Rule):
+        return entry
+    if isinstance(entry, str):
+        return Rule(text=entry)
+    if isinstance(entry, dict):
+        text = entry.get("text", "")
+        rid = entry.get("id") or ""
+        metadata = entry.get("metadata") or {}
+        return Rule(text=text, id=rid, metadata=metadata)
+    raise TypeError(f"Cannot upgrade entry of type {type(entry).__name__}")
 
 
 @dataclass
@@ -78,6 +121,14 @@ class Grammar:
         id is returned so the upsert path can use it directly.
         """
         return [(_expansion_text(e), _expansion_id(e)) for e in self.rules.get(rule, [])]
+
+    def get_rules(self, symbol: str) -> list[Rule]:
+        """Return list[Rule] for a symbol — the v0.5 preferred accessor.
+
+        ``get_expansions`` and ``get_expansion_items`` remain as backward-compat
+        shims. New code should prefer ``get_rules``.
+        """
+        return [upgrade_entry(e) for e in self.rules.get(symbol, [])]
 
     def add_expansion(self, rule: str, value: ExpansionEntry) -> None:
         if rule not in self.rules:
