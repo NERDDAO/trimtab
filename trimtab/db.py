@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -328,6 +328,122 @@ class TrimTabDB:
                 )
             )
         return rules
+
+    def _update_rule_fields(
+        self,
+        grammar: str,
+        symbol: str,
+        rule_id: str,
+        text: str | None = None,
+        metadata: dict | None = None,
+        new_vector: list[float] | None = None,
+    ) -> None:
+        """Update a Rule by id. Replaces text and/or merges metadata.
+
+        If ``text`` is provided, ``new_vector`` should also be supplied
+        (the caller is responsible for re-embedding). If ``text`` is None,
+        the existing text and embedding are preserved.
+
+        ``metadata`` is **merged** into the existing dict, not replaced —
+        new keys are added, existing keys are overwritten with new values,
+        unmentioned keys remain. Pass an empty dict ``{}`` to leave
+        metadata alone.
+
+        Raises ``TrimTabNotFoundError`` if no rule with ``rule_id`` exists
+        under the given (grammar, symbol).
+        """
+        from trimtab.errors import TrimTabNotFoundError
+
+        # Fetch existing rule fields for merge.
+        rows = self._conn.execute(
+            "MATCH (r:Rule) WHERE r.id = $id AND r.grammar = $g AND r.symbol = $s "
+            "RETURN r.text, r.metadata, r.embedding, r.created_at",
+            {"id": rule_id, "g": grammar, "s": symbol},
+        ).get_all()
+        if not rows:
+            raise TrimTabNotFoundError(grammar=grammar, symbol=symbol, rule_id=rule_id)
+
+        existing_text, existing_meta_str, existing_embedding, existing_created = rows[0]
+
+        # Strip the "json:" prefix from existing metadata, merge, re-encode.
+        existing_meta = json.loads(existing_meta_str[5:]) if existing_meta_str else {}
+        if metadata is not None:
+            existing_meta.update(metadata)
+        merged_meta_str = "json:" + json.dumps(existing_meta)
+
+        new_text = text if text is not None else existing_text
+        new_embedding_list = new_vector if new_vector is not None else list(existing_embedding)
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Delete-then-create (vector-indexed columns reject SET).
+        self._conn.execute(
+            "MATCH (r:Rule) WHERE r.id = $id DETACH DELETE r",
+            {"id": rule_id},
+        )
+        self._conn.execute(
+            "CREATE (r:Rule {"
+            "  id: $id, text: $text, grammar: $grammar, symbol: $symbol,"
+            "  metadata: $metadata, embedding: $embedding, embedded: $embedded,"
+            "  created_at: $created_at, updated_at: $updated_at"
+            "})",
+            {
+                "id": rule_id,
+                "text": new_text,
+                "grammar": grammar,
+                "symbol": symbol,
+                "metadata": merged_meta_str,
+                "embedding": new_embedding_list,
+                "embedded": True,
+                "created_at": existing_created,  # preserve original created_at
+                "updated_at": now,
+            },
+        )
+        # Re-wire the HAS_RULE edge from the symbol.
+        sym_id = f"{grammar}:{symbol}"
+        self._conn.execute(
+            "MATCH (s:Symbol), (r:Rule) "
+            "WHERE s.id = $sid AND r.id = $rid "
+            "MERGE (s)-[:HAS_RULE]->(r)",
+            {"sid": sym_id, "rid": rule_id},
+        )
+
+    def _remove_rule(self, grammar: str, symbol: str, rule_id: str) -> None:
+        """Hard-delete a Rule by id. Raises TrimTabNotFoundError if missing."""
+        from trimtab.errors import TrimTabNotFoundError
+
+        rows = self._conn.execute(
+            "MATCH (r:Rule) WHERE r.id = $id AND r.grammar = $g AND r.symbol = $s "
+            "RETURN r.id",
+            {"id": rule_id, "g": grammar, "s": symbol},
+        ).get_all()
+        if not rows:
+            raise TrimTabNotFoundError(grammar=grammar, symbol=symbol, rule_id=rule_id)
+        self._conn.execute(
+            "MATCH (r:Rule) WHERE r.id = $id DETACH DELETE r",
+            {"id": rule_id},
+        )
+
+    def _clear_symbol(self, grammar: str, symbol: str) -> None:
+        """Remove all Rules under (grammar, symbol). Leaves the Symbol node intact."""
+        self._conn.execute(
+            "MATCH (r:Rule) WHERE r.grammar = $g AND r.symbol = $s DETACH DELETE r",
+            {"g": grammar, "s": symbol},
+        )
+
+    def _drop_grammar(self, grammar: str) -> None:
+        """Remove all Rules, Symbols, and the Grammar node for a grammar."""
+        self._conn.execute(
+            "MATCH (r:Rule) WHERE r.grammar = $g DETACH DELETE r",
+            {"g": grammar},
+        )
+        self._conn.execute(
+            "MATCH (s:Symbol) WHERE s.grammar = $g DETACH DELETE s",
+            {"g": grammar},
+        )
+        self._conn.execute(
+            "MATCH (g:Grammar) WHERE g.name = $g_name DETACH DELETE g",
+            {"g_name": grammar},
+        )
 
     async def upsert_grammar(self, name: str, grammar: Grammar, embedder: Embedder) -> None:
         """Import a Grammar object into the DB. Embeds all expansions.
