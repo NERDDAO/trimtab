@@ -136,6 +136,28 @@ def test_migration_version_constant():
     assert MIGRATION_VERSION == "0.5.0"
 
 
+def test_migrated_rules_are_readable_via_trimtabdb_get_rules(tmp_path: Path):
+    """End-to-end: seeded v0.4 DB → TrimTabDB(__init__ runs migration) → _get_rules round-trips.
+
+    Regression guard for two bugs found post-Task-7:
+      1. _init_schema running before migration would fool detect_v04_schema
+         into thinking the DB was already v0.5 (because Symbol exists empty).
+      2. Migration writes metadata as bare "{}", but _get_rules strips a
+         "json:" prefix — without it, the slice produces "" and json.loads crashes.
+    """
+    from trimtab.db import TrimTabDB
+
+    db_path = str(tmp_path / "old.db")
+    _seed_v04_schema(db_path)
+
+    # Reopen via TrimTabDB. Migration must run during __init__.
+    ttdb = TrimTabDB(db_path)
+    rules = ttdb._get_rules("dev_memory", "notes")
+    assert len(rules) == 2
+    assert {r.text for r in rules} == {"first note", "second note"}
+    assert all(r.metadata == {} for r in rules)
+
+
 def test_migration_wraps_failures_in_trimtab_error(tmp_path: Path):
     """A failure inside run_migration must surface as TrimTabMigrationError, not raw."""
     from unittest.mock import patch

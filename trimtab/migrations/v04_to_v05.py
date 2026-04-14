@@ -168,7 +168,10 @@ def run_migration(conn: lb.Connection) -> None:
                     "text": etext,
                     "grammar": egrammar,
                     "symbol": symbol_name,
-                    "metadata": "{}",
+                    # "json:" prefix matches TrimTabDB._put_rule_with_vector's
+                    # encoding so post-migration _get_rules can decode without
+                    # special-casing legacy values.
+                    "metadata": "json:{}",
                     "embedding": list(eembedding),
                     "embedded": True,
                     "created_at": now,

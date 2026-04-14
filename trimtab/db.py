@@ -40,16 +40,19 @@ class TrimTabDB:
     def __init__(self, path: str = ":memory:"):
         self._db = lb.Database(path)
         self._conn = lb.Connection(self._db)
-        self._init_schema()
         self._init_vector_extension()
         self._embedding_dim: int | None = None
-        # Run v0.4 → v0.5 migration if the old schema is detected.
-        # Idempotent on fresh and already-migrated DBs.
+        # Migration MUST run before _init_schema. The migration's detector
+        # checks whether a Symbol table already exists and treats its
+        # presence as "DB is already v0.5". If _init_schema ran first and
+        # created an empty Symbol table, the detector would skip migration
+        # entirely on real v0.4 DBs. Order: migrate → init_schema → probe.
         from trimtab.migrations import run_migration
         try:
             run_migration(self._conn)
         except Exception as e:
             logger.warning("Migration attempt failed (non-fatal): %s", e)
+        self._init_schema()
         # If a Rule table exists (fresh-after-migration or previously-used v0.5),
         # probe its embedding dimension so subsequent puts respect it.
         self._embedding_dim = self._probe_existing_rule_dim()
