@@ -28,12 +28,12 @@ class StubEmbedder:
             digest = digest + hashlib.sha256(digest).digest()
         return [(b - 128) / 128.0 for b in digest[: self.dim]]
 
-    async def create(self, input_data):
+    async def create(self, input_data: str | list[str]) -> list[float]:
         self.call_count += 1
         text = input_data if isinstance(input_data, str) else " ".join(input_data)
         return self._vector(text)
 
-    async def create_batch(self, input_data_list):
+    async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
         self.batch_call_count += 1
         return [self._vector(t) for t in input_data_list]
 
@@ -44,6 +44,9 @@ def stub_embedder() -> StubEmbedder:
     return StubEmbedder(dim=16)
 
 
+# Legacy fixture — retained for pre-existing tests that already depend on it.
+# New tests should prefer StubEmbedder (above) which ships with call counters
+# and a byte-range normalization suited to hermetic v0.5 tests.
 class FakeEmbedder:
     """Deterministic async embedder matching trimtab's Embedder Protocol.
 
