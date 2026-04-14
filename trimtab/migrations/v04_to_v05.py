@@ -1,12 +1,15 @@
 """Migrate LadybugDB schema from v0.4 to v0.5.
 
 v0.4 shape: (:Grammar)-[:HAS_RULE]->(:Rule)-[:HAS_EXPANSION]->(:Expansion)
-v0.5 shape: (:Grammar)-[:HAS_SYMBOL]->(:Symbol)-[:HAS_RULE_V05]->(:Rule_v05)
+v0.5 shape: (:Grammar)-[:HAS_SYMBOL]->(:Symbol)-[:HAS_RULE]->(:Rule)
 
 This is a double rename. Ordering matters — we create new tables first,
-copy data, then drop old tables. The new v0.5 Rule node is named
-Rule_v05 during migration because it cannot share a name with the old
-v0.4 Rule table.
+copy data, then drop old tables. Interim tables named Rule_v05 and
+HAS_RULE_V05 are used during migration because the old v0.4 Rule and
+HAS_RULE tables cannot be dropped until their data is safely copied.
+After the old tables are dropped the interim tables are copied into the
+canonical v0.5 names (Rule, HAS_RULE) and the interim tables are
+dropped.
 
 The migration is idempotent: running on an already-migrated DB is a no-op
 because ``detect_v04_schema`` returns False when Symbol already exists.
@@ -124,6 +127,10 @@ def run_migration(conn: lb.Connection) -> None:
         old_rules = conn.execute(
             "MATCH (r_old:Rule) RETURN r_old.id, r_old.name, r_old.grammar"
         ).get_all()
+
+        # Build a lookup table for use in the expansion copy loop below.
+        rule_name_by_id = {row[0]: row[1] for row in old_rules}
+
         for row in old_rules:
             rid, rname, rgrammar = row[0], row[1], row[2]
             conn.execute(
@@ -147,12 +154,8 @@ def run_migration(conn: lb.Connection) -> None:
         for row in old_expansions:
             eid, etext, erule_id, egrammar, eembedding = row
 
-            # Get the symbol name from the old Rule node (its id is the rule_id).
-            sym_rows = conn.execute(
-                "MATCH (r_old:Rule) WHERE r_old.id = $rid RETURN r_old.name",
-                {"rid": erule_id},
-            ).get_all()
-            symbol_name = sym_rows[0][0] if sym_rows else ""
+            # Look up symbol name from the pre-built dict (avoids N+1 queries).
+            symbol_name = rule_name_by_id.get(erule_id, "")
 
             conn.execute(
                 "CREATE (r:Rule_v05 {"
@@ -196,6 +199,85 @@ def run_migration(conn: lb.Connection) -> None:
             conn.execute("DROP TABLE Rule")
         except Exception as e:
             logger.warning("drop Rule (old): %s", e)
+
+        # ---- Finalize schema names: Rule_v05 → Rule, HAS_RULE_V05 → HAS_RULE ----
+        # Old v0.4 Rule and HAS_RULE tables were dropped above. Now the canonical
+        # v0.5 names are free to use. Create them and copy from the interim tables.
+
+        # Create the final Rule node table with the same schema as Rule_v05.
+        try:
+            conn.execute(
+                f"CREATE NODE TABLE IF NOT EXISTS Rule("
+                f"  id STRING PRIMARY KEY,"
+                f"  text STRING,"
+                f"  grammar STRING,"
+                f"  symbol STRING,"
+                f"  metadata STRING,"
+                f"  embedding FLOAT[{dim}],"
+                f"  embedded BOOLEAN,"
+                f"  created_at STRING,"
+                f"  updated_at STRING"
+                f")"
+            )
+        except Exception:
+            pass
+
+        # Create the final HAS_RULE edge table.
+        try:
+            conn.execute(
+                "CREATE REL TABLE IF NOT EXISTS HAS_RULE(FROM Symbol TO Rule)"
+            )
+        except Exception:
+            pass
+
+        # Copy all Rule_v05 nodes → Rule nodes.
+        rule_rows = conn.execute(
+            "MATCH (r:Rule_v05) "
+            "RETURN r.id, r.text, r.grammar, r.symbol, r.metadata, "
+            "       r.embedding, r.embedded, r.created_at, r.updated_at"
+        ).get_all()
+        for row in rule_rows:
+            rid, rtext, rgrammar, rsymbol, rmeta, remb, rembedded, rcreated, rupdated = row
+            conn.execute(
+                "CREATE (r:Rule {"
+                "  id: $id, text: $text, grammar: $grammar, symbol: $symbol,"
+                "  metadata: $metadata, embedding: $embedding, embedded: $embedded,"
+                "  created_at: $created_at, updated_at: $updated_at"
+                "})",
+                {
+                    "id": rid,
+                    "text": rtext,
+                    "grammar": rgrammar,
+                    "symbol": rsymbol,
+                    "metadata": rmeta,
+                    "embedding": list(remb),
+                    "embedded": rembedded,
+                    "created_at": rcreated,
+                    "updated_at": rupdated,
+                },
+            )
+
+        # Copy all HAS_RULE_V05 edges → HAS_RULE edges.
+        edges = conn.execute(
+            "MATCH (s:Symbol)-[:HAS_RULE_V05]->(r:Rule_v05) RETURN s.id, r.id"
+        ).get_all()
+        for sid, rid in edges:
+            conn.execute(
+                "MATCH (s:Symbol), (r:Rule) "
+                "WHERE s.id = $sid AND r.id = $rid "
+                "MERGE (s)-[:HAS_RULE]->(r)",
+                {"sid": sid, "rid": rid},
+            )
+
+        # Drop the interim tables.
+        try:
+            conn.execute("DROP TABLE HAS_RULE_V05")
+        except Exception as e:
+            logger.warning("drop HAS_RULE_V05: %s", e)
+        try:
+            conn.execute("DROP TABLE Rule_v05")
+        except Exception as e:
+            logger.warning("drop Rule_v05: %s", e)
 
         logger.info(
             "Migrated %d symbols and %d rules to v0.5 schema",

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import real_ladybug as lb
 
 from trimtab.migrations.v04_to_v05 import (
@@ -101,7 +102,7 @@ def test_run_migration_creates_symbol_and_rule_tables(tmp_path: Path):
 
     run_migration(conn)
 
-    # After migration, new Symbol and new Rule_v05 tables must exist with data.
+    # After migration, new Symbol and new Rule tables must exist with data.
     symbols = conn.execute(
         "MATCH (s:Symbol) WHERE s.grammar = 'dev_memory' RETURN s.name"
     ).get_all()
@@ -109,7 +110,7 @@ def test_run_migration_creates_symbol_and_rule_tables(tmp_path: Path):
     assert symbols[0][0] == "notes"
 
     rules = conn.execute(
-        "MATCH (r:Rule_v05) WHERE r.grammar = 'dev_memory' RETURN r.text"
+        "MATCH (r:Rule) WHERE r.grammar = 'dev_memory' RETURN r.text"
     ).get_all()
     texts = {row[0] for row in rules}
     assert texts == {"first note", "second note"}
@@ -126,10 +127,39 @@ def test_migration_is_idempotent(tmp_path: Path):
     run_migration(conn)
 
     rules = conn.execute(
-        "MATCH (r:Rule_v05) WHERE r.grammar = 'dev_memory' RETURN r.text"
+        "MATCH (r:Rule) WHERE r.grammar = 'dev_memory' RETURN r.text"
     ).get_all()
     assert len(rules) == 2  # not doubled
 
 
 def test_migration_version_constant():
     assert MIGRATION_VERSION == "0.5.0"
+
+
+def test_migration_wraps_failures_in_trimtab_error(tmp_path: Path):
+    """A failure inside run_migration must surface as TrimTabMigrationError, not raw."""
+    from unittest.mock import patch
+    from trimtab.errors import TrimTabMigrationError
+
+    db_path = str(tmp_path / "old.db")
+    _seed_v04_schema(db_path)
+    database = lb.Database(db_path)
+    conn = lb.Connection(database)
+
+    # Let detect_v04_schema run normally, then poison the next execute call.
+    real_execute = conn.execute
+    call_count = {"n": 0}
+
+    def flaky_execute(*args, **kwargs):
+        call_count["n"] += 1
+        # After the detect probes (2 calls), fail the first real migration call.
+        if call_count["n"] > 2:
+            raise RuntimeError("simulated LadybugDB failure")
+        return real_execute(*args, **kwargs)
+
+    with patch.object(conn, "execute", side_effect=flaky_execute):
+        with pytest.raises(TrimTabMigrationError) as excinfo:
+            run_migration(conn)
+        # Chained cause should be our RuntimeError.
+        assert excinfo.value.__cause__ is not None
+        assert "simulated LadybugDB failure" in str(excinfo.value.__cause__)
