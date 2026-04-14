@@ -34,12 +34,19 @@ class TrimTab:
 
     def __init__(self, path: str = ":memory:", embedder: Embedder | None = None) -> None:
         self._db = TrimTabDB(self._expand_path(path))
+        # Resolve the embedder into a narrowed local so pyright can track its
+        # type across the if-branch, then assign. Without this the attribute
+        # would be typed as Embedder | None and every async write call site
+        # would need a guard.
+        resolved: Embedder
         if embedder is None:
             # Lazy import so TrimTab can be constructed in test environments
             # without Ollama as long as the caller supplies an embedder.
             from trimtab.embedders import OllamaEmbedder
-            embedder = OllamaEmbedder()  # may raise TrimTabEmbedderError
-        self._embedder = embedder
+            resolved = OllamaEmbedder()  # may raise TrimTabEmbedderError
+        else:
+            resolved = embedder
+        self._embedder = resolved
 
     @staticmethod
     def _expand_path(path: str) -> str:
