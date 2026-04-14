@@ -180,6 +180,35 @@ class TrimTab:
             top_k=top_k,
         )
 
+    async def generate(
+        self,
+        grammar: str,
+        context: str = "",
+        origin: str = "origin",
+        temperature: float = 0.3,
+        seed: int | None = None,
+        top_k: int = 5,
+        min_confidence: float = 0.0,
+        no_match_text: str = "",
+    ):
+        """Tracery-style walk with cascading embedding-based selection.
+
+        Returns a ``GenerationResult`` with ``text``, ``ids`` (walk order),
+        and ``rules_used`` (full Rule objects). Raises ``TrimTabCycleError``
+        if the grammar has a cyclic symbol reference.
+        """
+        from trimtab.generator import Generator
+        gen = Generator(db=self._db, grammar=grammar, embedder=self._embedder)
+        return await gen.generate(
+            context=context,
+            origin=origin,
+            temperature=temperature,
+            seed=seed,
+            top_k=top_k,
+            min_confidence=min_confidence,
+            no_match_text=no_match_text,
+        )
+
     # --- sync read / introspection ------------------------------------------
 
     def list(self, grammar: str, symbol: str) -> list[Rule]:

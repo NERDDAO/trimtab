@@ -4,7 +4,7 @@ import logging
 import random
 from typing import NamedTuple
 
-from trimtab.grammar import Grammar
+from trimtab.grammar import Grammar, Rule
 from trimtab.embedder import Embedder
 
 logger = logging.getLogger(__name__)
@@ -19,10 +19,14 @@ class GenerationResult(NamedTuple):
     extract external ids — LadybugDB auto-generates internal ids of the form
     ``{grammar}:{rule}:{hash(text)}``, so anything that doesn't match that
     shape is a consumer-supplied id (e.g. a KG entity UUID or path).
+    ``rules_used`` carries the full ``Rule`` objects walked during generation,
+    in walk order. Rules selected via random fallback paths (no DB lookup)
+    contribute nothing here.
     """
 
     text: str
     ids: list[str]
+    rules_used: list[Rule]  # full Rule objects walked, in order
 
 
 class Generator:
@@ -67,11 +71,11 @@ class Generator:
             fallbacks contribute an empty id for that level.
         """
         rng = random.Random(seed)
-        text, ids = await self._expand(
+        text, ids, rules_used = await self._expand(
             origin, context, temperature, rng, top_k,
             min_confidence, no_match_text, depth=0, visit_stack=[],
         )
-        return GenerationResult(text=text, ids=ids)
+        return GenerationResult(text=text, ids=ids, rules_used=rules_used)
 
     async def _expand(
         self,
@@ -84,7 +88,7 @@ class Generator:
         no_match_text: str,
         depth: int,
         visit_stack: list[str] | None = None,
-    ) -> tuple[str, list[str]]:
+    ) -> tuple[str, list[str], list[Rule]]:
         """Recursively expand a symbol with cascading context.
 
         ``visit_stack`` tracks the chain of symbols currently being expanded.
@@ -100,25 +104,26 @@ class Generator:
 
         if depth > 50:
             # Acyclic but pathologically deep — bail with a placeholder.
-            return f"[{rule}]", []
+            return f"[{rule}]", [], []
 
         # Fetch rules via the new v0.5 path (was: self._db.get_expansions).
         rule_objs = self._db._get_rules(self._grammar, rule)
         if not rule_objs:
-            return f"[{rule}]", []
+            return f"[{rule}]", [], []
         expansions = [r.text for r in rule_objs]
 
-        chosen_text, chosen_id = await self._select(
+        chosen_text, chosen_id, chosen_rule = await self._select(
             rule, context, expansions, temperature, rng, top_k, min_confidence, no_match_text
         )
 
         result = chosen_text
         walk_ids: list[str] = [chosen_id] if chosen_id else []
+        walk_rules: list[Rule] = [chosen_rule] if chosen_rule is not None else []
         refs = Grammar.extract_refs(chosen_text)
 
         for ref in refs:
             cascaded_context = f"{context} {result}" if context else result
-            sub_text, sub_ids = await self._expand(
+            sub_text, sub_ids, sub_rules = await self._expand(
                 ref,
                 cascaded_context,
                 temperature,
@@ -131,8 +136,9 @@ class Generator:
             )
             result = result.replace(f"#{ref}#", sub_text, 1)
             walk_ids.extend(sub_ids)
+            walk_rules.extend(sub_rules)
 
-        return result, walk_ids
+        return result, walk_ids, walk_rules
 
     async def _select(
         self,
@@ -144,39 +150,38 @@ class Generator:
         top_k: int,
         min_confidence: float = 0.0,
         no_match_text: str = "",
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, Rule | None]:
         """Select an expansion using embedding similarity + temperature.
 
-        Returns ``(text, id)`` — the chosen expansion text and its id from
-        the DB. For single-expansion rules the DB still owns the id (looked
-        up via a small query). For random / no-context fallbacks we return
-        an empty id because we never touched the DB's id mapping.
+        Returns ``(text, id, rule)`` — the chosen expansion text, its id from
+        the DB, and the full ``Rule`` object (or ``None`` for random / no-context
+        fallback paths that don't go through a DB rule lookup).
         """
         if len(expansions) == 1:
             # Single-expansion symbol — fetch the rule directly to get its id.
             rule_objs = self._db._get_rules(self._grammar, rule)
             if rule_objs:
-                return rule_objs[0].text, rule_objs[0].id
-            return expansions[0], ""
+                return rule_objs[0].text, rule_objs[0].id, rule_objs[0]
+            return expansions[0], "", None
 
         if temperature >= 1.0:
             # Fully random — pick an arbitrary expansion with no id tracking.
-            return rng.choice(expansions), ""
+            return rng.choice(expansions), "", None
 
         if not context:
-            return rng.choice(expansions), ""
+            return rng.choice(expansions), "", None
 
         context_vec = await self._embedder.create(context)
         rule_objs = self._db._search_rules(self._grammar, rule, context_vec, top_k=top_k)
 
         if not rule_objs:
             if min_confidence > 0:
-                return no_match_text, ""
-            return rng.choice(expansions), ""
+                return no_match_text, "", None
+            return rng.choice(expansions), "", None
 
         # Temperature == 0: top-1 (deterministic).
         if temperature <= 0.0:
-            return rule_objs[0].text, rule_objs[0].id
+            return rule_objs[0].text, rule_objs[0].id, rule_objs[0]
 
         # Temperature > 0: uniform sample from the top-k. (Real weighted
         # sampling by cosine score is a v0.6+ improvement — the new
@@ -185,7 +190,7 @@ class Generator:
             # Without scores we can't filter by confidence. Fall through to
             # the no-match path if there's nothing to sample.
             if not rule_objs:
-                return no_match_text, ""
+                return no_match_text, "", None
 
         idx = rng.randrange(len(rule_objs))
-        return rule_objs[idx].text, rule_objs[idx].id
+        return rule_objs[idx].text, rule_objs[idx].id, rule_objs[idx]
