@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 import real_ladybug as lb
 
 from trimtab.migrations.v04_to_v05 import (
@@ -15,7 +14,6 @@ from trimtab.migrations.v04_to_v05 import (
     run_migration,
     MIGRATION_VERSION,
 )
-from trimtab.errors import TrimTabMigrationError
 
 
 def _seed_v04_schema(db_path: str) -> None:
