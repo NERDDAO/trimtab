@@ -1,68 +1,22 @@
 """CLI for TrimTab: build, index, generate, add, list, show, export.
 
-The CLI ships a minimal in-file Ollama embedder so trimtab can be used
-standalone without pulling in delve's embedder service. Any Protocol-compatible
-embedder can be used programmatically.
+Uses the shipped OllamaEmbedder from trimtab.embedders. Any
+Protocol-compatible embedder can be used programmatically.
 """
 
 import argparse
 import asyncio
 import json
-import os
 import sys
 from pathlib import Path
 
-import requests
-
 from trimtab.builder import build_grammar
 from trimtab.db import TrimTabDB
+from trimtab.embedders import OllamaEmbedder
 from trimtab.grammar import Grammar
 
 
 DEFAULT_DB = str(Path.home() / ".trimtab" / "default.db")
-DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "all-minilm:22m")
-
-
-class _CLIOllamaEmbedder:
-    """Minimal Ollama-backed embedder for the CLI only.
-
-    Satisfies trimtab's ``Embedder`` Protocol structurally (async ``create``
-    and ``create_batch``). Not exported from the package; callers using
-    trimtab as a library should pass their own embedder instance.
-    """
-
-    def __init__(self, model: str = DEFAULT_OLLAMA_MODEL, base_url: str = DEFAULT_OLLAMA_URL):
-        self._model = model
-        self._base_url = base_url.rstrip("/")
-        # Fail fast if Ollama isn't reachable.
-        try:
-            resp = requests.get(f"{self._base_url}/api/tags", timeout=2)
-            resp.raise_for_status()
-        except Exception as e:
-            raise ConnectionError(
-                f"Cannot reach Ollama at {self._base_url}: {e}. "
-                f"Start ollama and run `ollama pull {model}`."
-            ) from e
-
-    async def create(self, input_data):
-        text = input_data if isinstance(input_data, str) else " ".join(input_data)
-        resp = requests.post(
-            f"{self._base_url}/api/embed",
-            json={"model": self._model, "input": text},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return [float(x) for x in resp.json()["embeddings"][0]]
-
-    async def create_batch(self, input_data_list):
-        resp = requests.post(
-            f"{self._base_url}/api/embed",
-            json={"model": self._model, "input": input_data_list},
-            timeout=60,
-        )
-        resp.raise_for_status()
-        return [[float(x) for x in vec] for vec in resp.json()["embeddings"]]
 
 
 def _get_db(args) -> TrimTabDB:
@@ -71,8 +25,8 @@ def _get_db(args) -> TrimTabDB:
     return TrimTabDB(db_path)
 
 
-def _get_embedder() -> _CLIOllamaEmbedder:
-    return _CLIOllamaEmbedder()
+def _get_embedder() -> OllamaEmbedder:
+    return OllamaEmbedder()
 
 
 async def cmd_index(args):
@@ -161,6 +115,69 @@ async def cmd_export(args):
     print(json.dumps(grammar.rules, indent=2, ensure_ascii=False))
 
 
+async def cmd_put(args):
+    """Insert a rule into a grammar/symbol."""
+    from trimtab.core import TrimTab
+    metadata = None
+    if args.metadata:
+        try:
+            metadata = json.loads(args.metadata)
+        except json.JSONDecodeError as e:
+            print(
+                f"error: --metadata must be valid JSON ({e.msg} at char {e.pos}). "
+                f"Example: --metadata '{{\"rank\": 1, \"tags\": [\"a\", \"b\"]}}'",
+                file=sys.stderr,
+            )
+            return 2
+    tt = TrimTab(path=args.db or DEFAULT_DB, embedder=_get_embedder())
+    rule = await tt.put(
+        grammar=args.grammar,
+        symbol=args.symbol,
+        text=args.text,
+        metadata=metadata,
+        id=args.id,
+    )
+    print(f"put {rule.id}  {rule.text}")
+
+
+async def cmd_search(args):
+    """Semantic search within a grammar/symbol."""
+    from trimtab.core import TrimTab
+    tt = TrimTab(path=args.db or DEFAULT_DB, embedder=_get_embedder())
+    rules = await tt.search(
+        grammar=args.grammar,
+        symbol=args.symbol,
+        query=args.query,
+        top_k=args.top_k,
+    )
+    if not rules:
+        print("(no results)")
+        return
+    for rule in rules:
+        print(f"{rule.id}  {rule.text}")
+
+
+async def cmd_remove(args):
+    """Delete a rule by id."""
+    from trimtab.core import TrimTab
+    tt = TrimTab(path=args.db or DEFAULT_DB, embedder=_get_embedder())
+    tt.remove(grammar=args.grammar, symbol=args.symbol, rule_id=args.id)
+    print(f"removed {args.id}")
+
+
+async def cmd_reembed(args):
+    """Stubbed placeholder for v0.5.
+
+    Full wipe-and-rebuild is post-v0.5 scope; for now the user must
+    delete the DB file and re-ingest with the new embedder.
+    """
+    print(
+        "reembed: v0.5 does not yet wipe-and-rebuild in place. Delete the "
+        "DB file and re-ingest with the new embedder, or open an issue."
+    )
+    return 1
+
+
 def main():
     parser = argparse.ArgumentParser(prog="trimtab", description="Context-aware grammar generation")
     parser.add_argument("--db", default=None, help=f"Database path (default: {DEFAULT_DB})")
@@ -202,6 +219,35 @@ def main():
     p = sub.add_parser("export", help="Export grammar to JSON")
     p.add_argument("grammar", help="Grammar name")
 
+    # --- put
+    p_put = sub.add_parser("put", help="insert a rule into a grammar/symbol")
+    p_put.add_argument("grammar")
+    p_put.add_argument("symbol")
+    p_put.add_argument("text")
+    p_put.add_argument("--metadata", help="JSON metadata dict", default=None)
+    p_put.add_argument("--id", default=None)
+    p_put.set_defaults(func=cmd_put)
+
+    # --- search
+    p_search = sub.add_parser("search", help="semantic search within a symbol")
+    p_search.add_argument("grammar")
+    p_search.add_argument("symbol")
+    p_search.add_argument("query")
+    p_search.add_argument("--top-k", type=int, default=5)
+    p_search.set_defaults(func=cmd_search)
+
+    # --- remove
+    p_rm = sub.add_parser("remove", help="delete a rule by id")
+    p_rm.add_argument("grammar")
+    p_rm.add_argument("symbol")
+    p_rm.add_argument("id")
+    p_rm.set_defaults(func=cmd_remove)
+
+    # --- reembed
+    p_re = sub.add_parser("reembed", help="wipe and rebuild embeddings for a DB")
+    p_re.add_argument("--embedder", default=None, help="embedder selector (reserved)")
+    p_re.set_defaults(func=cmd_reembed)
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -215,6 +261,10 @@ def main():
         "list": cmd_list,
         "show": cmd_show,
         "export": cmd_export,
+        "put": cmd_put,
+        "search": cmd_search,
+        "remove": cmd_remove,
+        "reembed": cmd_reembed,
     }
     asyncio.run(cmds[args.command](args))
 

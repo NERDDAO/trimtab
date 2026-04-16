@@ -1,8 +1,8 @@
 # TrimTab
 
-Context-aware grammar generation with cascading embedding search.
+**Embedded memory and generation for agentic Python.**
 
-Combines Tracery-style grammars with embedding-based selection. Grammar rules define **structure** (enforced). Embeddings select the most **contextually appropriate** expansion at each level (cascading). The grammar tree is always respected — only the content within each slot is selected by semantic relevance.
+TrimTab is a lightweight memory store built on Tracery-style grammars, where every rule is embedded on ingest so you can list, search, or walk it with context. One inbound route (`put`), three read modes (`list`, `search`, `generate`), and a shipped Ollama default embedder.
 
 ## Install
 
@@ -10,232 +10,210 @@ Combines Tracery-style grammars with embedding-based selection. Grammar rules de
 pip install trimtab
 ```
 
-## Quick Start
+TrimTab ships with Ollama as the default embedder. If you don't already have it:
+
+```bash
+# install Ollama: https://ollama.com
+ollama pull nomic-embed-text
+ollama serve
+```
+
+Or bring your own embedder:
 
 ```python
 from trimtab import TrimTab
 
-# Load a grammar and index it
-sg = TrimTab.from_file("narration.json")
-sg.index()
-
-# Generate with context — embedding selects the best expansion at each level
-text = sg.generate(context="dark crypt, eerie mood", temperature=0.3)
-# → "Chains rattle from the depths below. The stale air tastes of decay."
-
-# Same grammar, different context
-text = sg.generate(context="sunlit forest, peaceful", temperature=0.3)
-# → "Wind howls through the clearing. The warm air carries a faint breeze."
+tt = TrimTab(path="memory.db", embedder=my_own_embedder)
 ```
 
-## How It Works
+## The 30-second model
 
-### Cascading Context
+A **grammar** is a named namespace (e.g. `"agent_abc123"`, `"dev_memory"`). Inside it, **symbols** are categories (`"friends"`, `"notes"`, `"origin"`). Under each symbol, **rules** are individual entries — the things you'd call rows in a database. Every rule carries text, optional metadata, and an embedding computed on ingest.
 
-At each level of the grammar tree, the chosen expansion feeds into the context for the next level:
-
-```
-Context: "dark crypt, eerie mood"
-
-origin → "#sensory#. #atmosphere#."     (structure enforced)
-  sensory → "#sound# echoes from #direction#"
-    sound → "Chains rattle"              ← embedding picks this for "crypt"
-    direction → "the depths below"       ← embedding picks this for "crypt + chains"
-  atmosphere → "The #air# air tastes of #smell#"
-    air → "stale"                        ← embedding picks this for "crypt + chains + depths"
-    smell → "decay"                      ← embedding picks this for all of the above
-```
-
-Grammar structure is always enforced. Content is selected by semantic relevance cascading through the tree. This is not random generation — it's structured retrieval.
-
-### Temperature
+One way in:
 
 ```python
-sg.generate(context, temperature=0.0)  # always top-1 (deterministic)
-sg.generate(context, temperature=0.3)  # weighted sample from top-5 (recommended)
-sg.generate(context, temperature=1.0)  # uniform random (classic Tracery behavior)
+from trimtab import TrimTab
+
+tt = TrimTab(path="memory.db")
+
+await tt.put(
+    grammar="agent_01", symbol="notes",
+    text="The forest is dangerous at night",
+    metadata={"source": "ranger_alice"},
+)
 ```
 
-## Use Cases
-
-### 1. Software Development Memory
-
-Template structure: what rule applies, what pattern to follow, what the user prefers.
-
-```json
-{
-  "origin": ["Rule: #rules#\nPattern: #patterns#\nPreference: #preferences#"],
-  "rules": [
-    "Always close old WebSocket before creating new one in session.ts",
-    "Use get_entity by UUID not text search — names are display only",
-    "Run impact analysis before editing any symbol — check blast radius",
-    "Don't hand-roll when a library exists — check pip and GitHub first"
-  ],
-  "patterns": [
-    "Crews consume procgen scaffolds — scaffold param on first task description",
-    "Background art uses daemon threads — non-blocking crew kickoff",
-    "Config resolves via get_model_for_crew — crew name to override key",
-    "NPC agents act through mm_ tools — dialogue movement inventory"
-  ],
-  "preferences": [
-    "Scaffold mode over replace — crews keep running with pre-filled context",
-    "Subagent-driven development for plan execution",
-    "Leverage open source over hand-rolling",
-    "Flat KG attributes not nested JSON — Neo4j friendly"
-  ]
-}
-```
+Three ways out:
 
 ```python
-sg = TrimTab.from_file("dev_memory.json")
-sg.index()
+# Flat enumeration — insertion ordered, no embedding math
+notes = tt.list(grammar="agent_01", symbol="notes")
 
-sg.generate(context="debugging WebSocket connection drops")
-# → Rule: Always close old WebSocket before creating new one in session.ts
+# Semantic search — top-k by cosine similarity
+hits = await tt.search(grammar="agent_01", symbol="notes",
+                       query="safe travel?", top_k=3)
+
+# Cascading Tracery walk — context-aware structured retrieval
+result = await tt.generate(grammar="agent_01",
+                           context="journey planning",
+                           origin="origin")
+```
+
+![Data flow](docs/diagrams/trimtab-data-flow.svg)
+
+## Agentic memory pattern
+
+```python
+from trimtab import TrimTab
+
+tt = TrimTab(path="~/.trimtab/agent.db")
+GRAMMAR = "agent_01"
+
+async def agent_turn(user_message: str) -> str:
+    # 1. Read relevant context from accumulated memory.
+    relevant = await tt.search(GRAMMAR, "notes",
+                               query=user_message, top_k=5)
+    context = "\n".join(f"- {r.text}" for r in relevant)
+
+    # 2. Call your LLM with context + user message.
+    response = await call_llm(context=context, message=user_message)
+
+    # 3. Write new observations back to memory.
+    await tt.put(GRAMMAR, "notes", text=f"User asked: {user_message}")
+    if response.notable:
+        await tt.put(GRAMMAR, "notes", text=response.summary,
+                     metadata={"turn": turn_id})
+
+    return response.text
+```
+
+The agent reads with `search`, writes with `put`, and that's the whole loop. No semantic-vs-store-mode distinction — every write is searchable by construction.
+
+## Use cases
+
+### Software development memory
+
+Three symbols — rules, patterns, preferences — retrieved in one walk:
+
+```python
+await tt.put("dev_memory", "rules",
+    "Close old WebSocket before creating new one in session.ts")
+await tt.put("dev_memory", "patterns",
+    "Background art uses daemon threads — non-blocking crew kickoff")
+await tt.put("dev_memory", "preferences",
+    "Scaffold mode over replace — crews keep running with pre-filled context")
+
+await tt.put("dev_memory", "origin",
+    "Rule: #rules#\nPattern: #patterns#\nPreference: #preferences#")
+
+result = await tt.generate("dev_memory",
+                           context="debugging WebSocket connection drops")
+print(result.text)
+# → Rule: Close old WebSocket before creating new one in session.ts
 #   Pattern: Background art uses daemon threads — non-blocking crew kickoff
 #   Preference: Scaffold mode over replace — crews keep running with pre-filled context
 ```
 
-Every query returns a relevant rule, a relevant architectural pattern, and a relevant preference — structured multi-faceted recall, not just "find the one best match."
-
-### 2. Project Management
-
-Template structure: where things stand, what's in the way, what to do next.
-
-```json
-{
-  "origin": ["Status: #status#\nBlocker: #blockers#\nNext: #next_actions#"],
-  "status": [
-    "Auth system — JWT refresh flow merged, waiting on staging deploy",
-    "Payment integration — Stripe webhook handler 80% complete, needs error handling",
-    "Mobile app — v2.1 release branch cut, QA in progress",
-    "Search rewrite — Elasticsearch migration planned, not started",
-    "Onboarding flow — A/B test running since Monday, early results positive"
-  ],
-  "blockers": [
-    "Staging environment is down — DevOps ticket INFRA-342 open since Thursday",
-    "Stripe test keys expired — waiting on finance team to rotate",
-    "iOS build failing on CI — Xcode 16 compatibility issue",
-    "Search index rebuild requires 4h maintenance window — needs scheduling",
-    "Design review for onboarding v2 not yet scheduled"
-  ],
-  "next_actions": [
-    "Deploy auth changes to staging once environment is restored",
-    "Write integration tests for Stripe webhook edge cases",
-    "Update CI to Xcode 16 and fix Swift package resolution",
-    "Draft Elasticsearch migration plan and circulate for review",
-    "Schedule design review for onboarding with product team"
-  ]
-}
-```
+### Project management
 
 ```python
-sg = TrimTab.from_file("project.json")
-sg.index()
+await tt.put("project", "status",
+    "Auth — JWT flow merged, waiting on staging deploy")
+await tt.put("project", "blockers",
+    "Staging down — DevOps ticket INFRA-342 open since Thursday")
+await tt.put("project", "next_actions",
+    "Deploy auth changes once staging is restored")
 
-sg.generate(context="payment processing, what's the state of Stripe")
-# → Status: Payment integration — Stripe webhook handler 80% complete, needs error handling
-#   Blocker: Stripe test keys expired — waiting on finance team to rotate
-#   Next: Write integration tests for Stripe webhook edge cases
+await tt.put("project", "origin",
+    "Status: #status#\nBlocker: #blockers#\nNext: #next_actions#")
+
+result = await tt.generate("project",
+                           context="what's blocking the auth deploy")
 ```
 
-The cascading context means the blocker and next action are selected in light of the status — not independently. If the status is about payments, the blocker will be payment-related too.
-
-### 3. Research / Learning
-
-Template structure: what you know, what connects to it, what's still unknown.
-
-```json
-{
-  "origin": ["Known: #facts#\nRelated: #connections#\nGap: #questions#"],
-  "facts": [
-    "Transformer attention is O(n^2) in sequence length",
-    "Wave Function Collapse generates tilemaps from adjacency constraints",
-    "HDBSCAN finds clusters of varying density without requiring k",
-    "Embedding cosine similarity approximates semantic relatedness",
-    "N-gram frequency follows Zipf's law — few very common, long tail of rare"
-  ],
-  "connections": [
-    "WFC adjacency rules are similar to Markov chain transition matrices",
-    "HDBSCAN clustering + embeddings is essentially unsupervised topic modeling",
-    "Cascading context in grammar expansion mirrors beam search decoding",
-    "N-gram extraction from LLM output is a form of knowledge distillation",
-    "Tracery grammars are context-free — TrimTab adds context-sensitivity via embeddings"
-  ],
-  "questions": [
-    "Can cascading embedding search approximate attention without quadratic cost?",
-    "What happens when grammar rules have cyclic references?",
-    "How does embedding quality degrade for domain-specific jargon?",
-    "Is there a principled way to set the confidence threshold per rule?",
-    "Could grammar structure itself be learned from the embedding clusters?"
-  ]
-}
-```
+### Research / learning
 
 ```python
-sg = TrimTab.from_file("research.json")
-sg.index()
+await tt.put("research", "facts",
+    "HDBSCAN finds clusters of varying density without requiring k")
+await tt.put("research", "connections",
+    "HDBSCAN + embeddings is essentially unsupervised topic modeling")
+await tt.put("research", "questions",
+    "How does embedding quality degrade for domain-specific jargon?")
 
-sg.generate(context="using embeddings to cluster text without labeled data")
-# → Known: HDBSCAN finds clusters of varying density without requiring k
-#   Related: HDBSCAN clustering + embeddings is essentially unsupervised topic modeling
-#   Gap: How does embedding quality degrade for domain-specific jargon?
+await tt.put("research", "origin",
+    "Known: #facts#\nRelated: #connections#\nGap: #questions#")
+
+result = await tt.generate("research",
+                           context="clustering text without labels")
 ```
-
-The three slots work as a learning scaffold: here's what you know, here's how it connects, here's what you don't know yet.
-
-## Building Grammars From Text
-
-Don't have a grammar? Build one from a corpus of text:
-
-```python
-sg = TrimTab.build_from_corpus(texts=[
-    "The server crashed at 3am due to memory leak in the cache layer",
-    "Database connection pool exhausted during peak traffic",
-    "JWT validation failing silently — tokens expired but no error logged",
-    # ... hundreds more lines from incident reports, standups, etc.
-])
-sg.index()
-```
-
-The builder extracts n-grams, clusters them by embedding similarity, and creates grammar rules from the clusters. Optionally, an LLM crew pass names the clusters and prunes garbage entries.
-
-## Self-Improving
-
-Grammars grow over time. When a crew or user produces good output, feed it back:
-
-```python
-sg.add("rules", "Never force-push to main without explicit user confirmation")
-# Auto-embeds and indexes — available for next query
-```
-
-Combined with n-gram extraction from ongoing work, the grammar becomes a distillation of accumulated knowledge.
 
 ## CLI
 
 ```bash
-# Index a grammar for embedding search
-trimtab index grammar.json
+# Put a rule
+trimtab put agent_01 notes "The forest is dangerous at night"
 
-# Generate with context
-trimtab generate grammar.sg --context "dark crypt" --temperature 0.3
+# Semantic search
+trimtab search agent_01 notes "safe travel" --top-k 3
 
-# Build grammar from text corpus
-trimtab build --input corpus.txt --output grammar.json
+# Remove a rule by id
+trimtab remove agent_01 notes r_01HXYZ...
 
-# Add entry to a rule
-trimtab add grammar.sg sound "Bones crunch underfoot"
+# List grammars and symbols
+trimtab list
+trimtab show agent_01
+
+# Export a grammar to JSON (Tracery-compatible)
+trimtab export agent_01 > agent_01.json
+
+# Wipe and rebuild embeddings with a new embedder (post-v0.5 scope;
+# currently a no-op that prints instructions)
+trimtab reembed --embedder nomic-embed-text
 ```
 
 ## Embedder
 
-Ships with `sentence-transformers/all-MiniLM-L6-v2` (~80MB, works offline). Auto-upgrades to Ollama if running locally for better quality.
+TrimTab ships with `trimtab.embedders.OllamaEmbedder` as the default. It calls `http://localhost:11434/api/embed` and defaults to `nomic-embed-text` (768-dim, fast, commonly available).
+
+BYO embedder — implement the `Embedder` protocol:
 
 ```python
-from trimtab import OllamaEmbedder, TrimTab
+from trimtab import Embedder, TrimTab
 
-sg = TrimTab.from_file("grammar.json", embedder=OllamaEmbedder(model="nomic-embed-text"))
+class MyEmbedder:
+    async def create(self, text: str) -> list[float]: ...
+    async def create_batch(self, texts: list[str]) -> list[list[float]]: ...
+
+tt = TrimTab(path="memory.db", embedder=MyEmbedder())
 ```
+
+**Per-DB dimension pinning.** LadybugDB fixes embedding dimension at first write. One DB file = one embedder model. If you need multiple embedders, use multiple DB files.
+
+## Errors
+
+| Error | When |
+|---|---|
+| `TrimTabEmbedderError` | Ollama unreachable / model missing / embed call failed |
+| `TrimTabNotFoundError` | `update`/`remove` on an id that doesn't exist |
+| `TrimTabDimensionError` | Embedder dim doesn't match the DB's pinned dim |
+| `TrimTabMigrationError` | v0.4 → v0.5 auto-migration failed |
+| `TrimTabGrammarError` | Malformed JSON on `load_file` |
+| `TrimTabCycleError` | `generate` hit a cyclic symbol reference |
+
+All are subclasses of `TrimTabError` — catch once to handle any.
+
+## Status
+
+**v0.5.0 is a breaking release.** Terminology aligned to Tracery (what was `Rule` is now `Symbol`, what was `Expansion` is now `Rule`). LadybugDB schema migrates automatically on first open. `SmartGrammar` stays as a deprecated alias; removed in v0.6. See `CHANGELOG.md` for the full list.
+
+**Concurrency:** Single-writer per grammar. Last-write-wins if you violate that. Locks and optimistic concurrency are out of scope for v0.5.
+
+## See also
+
+- `trimtab/builder.py` — build a grammar from a text corpus (HDBSCAN clustering). Power-user feature, not covered here.
+- `docs/superpowers/specs/2026-04-14-trimtab-memory-system-design.md` (in the Bonfires workspace) — full v0.5 design spec.
 
 ## License
 
