@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.1 — 2026-04-16
+
+### Added
+
+- `TrimTab.summary()` — sync method returning a per-grammar snapshot of
+  every rule (`{grammar: [{"id", "symbol", "text", "metadata", ...}]}`)
+  in a single in-process query. Designed for callers that build
+  context-window summaries on every agent turn and need to avoid N
+  round-trips to the underlying store.
+
 ## 0.5.0 — 2026-04-14
 
 **Breaking release.** TrimTab evolves from a generation library into a

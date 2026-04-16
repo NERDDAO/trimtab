@@ -238,6 +238,20 @@ class TrimTab:
         """Return the number of rules under (grammar, symbol). Zero if missing."""
         return self._db._count_rules(grammar, symbol)
 
+    def summary(self) -> dict[str, list[dict[str, Any]]]:
+        """Per-grammar snapshot of every rule in the embedded store.
+
+        Single in-process query. Returns ``{grammar: [{"id", "symbol",
+        "text", "metadata", "created_at", "updated_at"}, ...]}`` — empty
+        dict if no rules have been written yet.
+
+        Intended for callers that build context-window summaries on every
+        agent turn and need to avoid N round-trips to the underlying
+        store. Aggregation (counts, status distributions, sorted lists)
+        is the caller's job — this method is the raw read.
+        """
+        return self._db._summary_all()
+
     # --- sync mutation -----------------------------------------------------
 
     def remove(self, grammar: str, symbol: str, rule_id: str) -> None:

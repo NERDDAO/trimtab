@@ -27,7 +27,7 @@ from trimtab.errors import (
 from trimtab.generator import GenerationResult, Generator
 from trimtab.grammar import Grammar, Rule
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 __all__ = [
     "TrimTab",

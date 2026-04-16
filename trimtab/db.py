@@ -6,6 +6,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import real_ladybug as lb
@@ -472,6 +473,44 @@ class TrimTabDB:
             return int(db_rows[0][0]) if db_rows else 0
         except Exception:
             return 0
+
+    def _summary_all(self) -> dict[str, list[dict[str, Any]]]:
+        """One-roundtrip snapshot of every rule grouped by grammar.
+
+        Returns ``{grammar: [{"id", "symbol", "text", "metadata",
+        "created_at", "updated_at"}, ...]}``. Empty dict if no rules
+        have been written yet (Rule node table is created lazily on
+        first put).
+
+        Used by ``TrimTab.summary()`` for callers that build context
+        snapshots on every turn and want to skip N round-trips.
+        """
+        try:
+            result = self._conn.execute(
+                "MATCH (r:Rule) "
+                "RETURN r.grammar, r.symbol, r.id, r.text, r.metadata, "
+                "r.created_at, r.updated_at "
+                "ORDER BY r.grammar, r.symbol, r.created_at"
+            )
+            rows = result.get_all()
+        except Exception:
+            return {}
+
+        snapshot: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            grammar, symbol, rid, text, meta_str, created, updated = row
+            meta = json.loads(meta_str[5:]) if meta_str else {}
+            snapshot.setdefault(grammar, []).append(
+                {
+                    "id": rid,
+                    "symbol": symbol,
+                    "text": text,
+                    "metadata": meta,
+                    "created_at": created,
+                    "updated_at": updated,
+                }
+            )
+        return snapshot
 
     async def upsert_grammar(self, name: str, grammar: Grammar, embedder: Embedder) -> None:
         """DEPRECATED. Use TrimTab.load_file or TrimTab.put per entry.
