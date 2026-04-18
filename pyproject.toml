@@ -7,7 +7,8 @@ name = "trimtab"
 version = "0.5.1"
 description = "Embedded memory and generation for agentic Python — Tracery-style grammars with semantic recall"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "real-ladybug>=0.15",
     "numpy>=1.24",
