@@ -1,4 +1,8 @@
+"""Round-trip reads from v0.5 Symbol/Rule schema."""
+
 import pytest
+
+from tests.conftest import list_rules_text_id, load_grammar_bulk
 from trimtab.db import TrimTabDB
 from trimtab.grammar import Grammar
 
@@ -12,7 +16,7 @@ class FakeEmbedder:
 
 
 @pytest.mark.asyncio
-async def test_list_entries_returns_text_and_id():
+async def test_list_rules_returns_text_and_id():
     db = TrimTabDB(":memory:")
     grammar = Grammar.from_dict({
         "writers": [
@@ -20,9 +24,9 @@ async def test_list_entries_returns_text_and_id():
             {"text": "Tolkien — novelist", "id": "entity/uuid2"},
         ],
     })
-    await db.upsert_grammar("lit", grammar, FakeEmbedder())
+    await load_grammar_bulk(db, "lit", grammar, FakeEmbedder())
 
-    entries = db.list_entries("lit", "writers")
+    entries = list_rules_text_id(db, "lit", "writers")
     assert len(entries) == 2
     texts = {t for t, _ in entries}
     ids = {i for _, i in entries}
@@ -32,10 +36,10 @@ async def test_list_entries_returns_text_and_id():
 
 
 @pytest.mark.asyncio
-async def test_list_entries_empty_rule():
+async def test_list_rules_empty_symbol():
     db = TrimTabDB(":memory:")
     grammar = Grammar.from_dict({"writers": [{"text": "x", "id": "y"}]})
-    await db.upsert_grammar("lit", grammar, FakeEmbedder())
+    await load_grammar_bulk(db, "lit", grammar, FakeEmbedder())
 
-    entries = db.list_entries("lit", "nonexistent")
+    entries = list_rules_text_id(db, "lit", "nonexistent")
     assert entries == []

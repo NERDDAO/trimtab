@@ -84,3 +84,37 @@ def mem_db():
     """In-memory TrimTabDB for tests."""
     from trimtab.db import TrimTabDB
     return TrimTabDB(":memory:")
+
+
+async def load_grammar_bulk(db, grammar_name, grammar, embedder):
+    """Test helper — replaces the deprecated ``TrimTabDB.upsert_grammar``.
+
+    Walks the Grammar dict, batch-embeds every rule's text, and inserts
+    via the v0.5 ``_put_rule_with_vector`` path.
+    """
+    from trimtab.grammar import upgrade_entry
+
+    all_items = []
+    for symbol_name in grammar.rule_names():
+        for entry in grammar.rules.get(symbol_name, []):
+            all_items.append((symbol_name, upgrade_entry(entry)))
+    if not all_items:
+        return
+    texts = [r.text for _, r in all_items]
+    vectors = await embedder.create_batch(texts)
+    for (symbol_name, rule_obj), vec in zip(all_items, vectors, strict=True):
+        db._put_rule_with_vector(grammar=grammar_name, symbol=symbol_name, rule=rule_obj, vector=vec)
+
+
+async def add_rule(db, grammar_name, symbol, text, embedder, id=None):
+    """Test helper — replaces the deprecated ``TrimTabDB.add_expansion``."""
+    from trimtab.grammar import Rule
+
+    vec = await embedder.create(text)
+    rule = Rule(text=text, id=id or "")
+    return db._put_rule_with_vector(grammar=grammar_name, symbol=symbol, rule=rule, vector=vec)
+
+
+def list_rules_text_id(db, grammar_name, symbol):
+    """Test helper — replaces the deprecated ``TrimTabDB.list_entries``."""
+    return [(r.text, r.id) for r in db._get_rules(grammar_name, symbol)]

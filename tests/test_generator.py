@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 
+from tests.conftest import add_rule, load_grammar_bulk
 from trimtab.generator import GenerationResult, Generator
 from trimtab.grammar import Grammar
 
@@ -18,7 +19,7 @@ async def gen(mem_db, fake_embedder):
             "detail": ["shadows move", "birds sing", "silence reigns"],
         }
     )
-    await mem_db.upsert_grammar("test", grammar, fake_embedder)
+    await load_grammar_bulk(mem_db, "test", grammar, fake_embedder)
     return Generator(mem_db, "test", fake_embedder)
 
 
@@ -73,9 +74,9 @@ async def test_generate_returns_ids_from_walked_expansions(gen):
     # The walk visits origin + mood + detail (3 rules with content picks), so
     # we expect at least those 3 ids when context drives deterministic picks.
     assert len(result.ids) >= 2
-    # Auto-generated ids from add_expansion have the shape "{grammar}:{rule}:{hash}"
-    # — by default none of the tests set custom ids so all walks produce auto ids.
-    assert all(isinstance(i, str) and ":" in i for i in result.ids)
+    # Auto-generated ids in v0.5 have the shape "r_{hex32}" — by default no
+    # tests here set custom ids so all walks produce auto ids.
+    assert all(isinstance(i, str) and i.startswith("r_") for i in result.ids)
 
 
 @pytest.mark.asyncio
@@ -89,25 +90,17 @@ async def test_generate_preserves_custom_ids_from_db(mem_db, fake_embedder):
     ``upsert_grammar`` would otherwise insert for the same texts.
     """
     # Grammar only declares the origin rule. The skill rule will be
-    # populated below via explicit add_expansion calls.
+    # populated below via explicit per-rule adds with custom ids.
     grammar = Grammar.from_dict({"origin": ["applicant has #skill#"]})
-    await mem_db.upsert_grammar("skills", grammar, fake_embedder)
+    await load_grammar_bulk(mem_db, "skills", grammar, fake_embedder)
 
-    vec = await fake_embedder.create("audited defi protocols")
-    mem_db.add_expansion(
-        "skills",
-        "skill",
-        "audited defi protocols",
-        vec,
-        id="applicant/security/community_x/uuid-audit",
+    await add_rule(
+        mem_db, "skills", "skill", "audited defi protocols",
+        fake_embedder, id="applicant/security/community_x/uuid-audit",
     )
-    vec2 = await fake_embedder.create("found critical bugs")
-    mem_db.add_expansion(
-        "skills",
-        "skill",
-        "found critical bugs",
-        vec2,
-        id="applicant/security/community_x/uuid-bugs",
+    await add_rule(
+        mem_db, "skills", "skill", "found critical bugs",
+        fake_embedder, id="applicant/security/community_x/uuid-bugs",
     )
 
     generator = Generator(mem_db, "skills", fake_embedder)
@@ -122,16 +115,17 @@ async def test_generate_preserves_custom_ids_from_db(mem_db, fake_embedder):
 async def test_generation_result_is_namedtuple_unpackable(gen):
     """GenerationResult supports both tuple unpacking and field access."""
     result = await gen.generate(context="test", temperature=0.0, seed=7)
-    text, ids = result  # tuple unpacking still works
+    text, ids, rules_used = result  # v0.5: 3-tuple (rules_used added)
     assert text == result.text
     assert ids == result.ids
+    assert rules_used == result.rules_used
 
 
 @pytest.mark.asyncio
-async def test_upsert_grammar_honors_explicit_expansion_ids(mem_db, fake_embedder):
+async def test_bulk_load_honors_explicit_rule_ids(mem_db, fake_embedder):
     """Grammar dict entries of the shape ``{"text", "id"}`` should flow
-    through ``upsert_grammar`` with the explicit id preserved — no two-step
-    upsert + add_expansion dance required."""
+    through the bulk loader with the explicit id preserved — no two-step
+    load + per-rule-add dance required."""
     grammar = Grammar.from_dict(
         {
             "origin": ["applicant #skill#"],
@@ -141,14 +135,14 @@ async def test_upsert_grammar_honors_explicit_expansion_ids(mem_db, fake_embedde
             ],
         }
     )
-    await mem_db.upsert_grammar("skills", grammar, fake_embedder)
+    await load_grammar_bulk(mem_db, "skills", grammar, fake_embedder)
 
     generator = Generator(mem_db, "skills", fake_embedder)
     result = await generator.generate(context="audit work", temperature=0.0, seed=0)
 
-    # The cascade walks origin → skill → one of the custom-id expansions.
+    # The cascade walks origin → skill → one of the custom-id entries.
     # At least one of the walked ids should be a custom one.
     custom_ids = [i for i in result.ids if i.startswith("applicant/")]
     assert custom_ids, f"expected a custom id in walk, got {result.ids}"
-    # And none of the rows for the "skill" rule should have auto-generated ids.
-    assert not any(i.startswith("skills:skill:") for i in result.ids)
+    # And none of the skill-symbol rows should fall back to the auto-id shape.
+    assert not any(i.startswith("r_") for i in custom_ids)

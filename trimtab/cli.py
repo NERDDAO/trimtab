@@ -9,11 +9,12 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from trimtab.builder import build_grammar
 from trimtab.db import TrimTabDB
 from trimtab.embedders import OllamaEmbedder
-from trimtab.grammar import Grammar
+from trimtab.grammar import Grammar, upgrade_entry
 
 
 DEFAULT_DB = str(Path.home() / ".trimtab" / "default.db")
@@ -35,8 +36,24 @@ async def cmd_index(args):
     embedder = _get_embedder()
     grammar = Grammar.from_file(args.grammar)
     name = args.name or Path(args.grammar).stem
-    await db.upsert_grammar(name, grammar, embedder)
-    print(f"Imported '{name}' ({len(grammar.rule_names())} rules)")
+    await _load_grammar_into_db(db, name, grammar, embedder)
+    print(f"Imported '{name}' ({len(grammar.rule_names())} symbols)")
+
+
+async def _load_grammar_into_db(db: TrimTabDB, grammar_name: str, grammar: Grammar, embedder) -> None:
+    """Bulk-load a Grammar into v0.5 tables. Replaces the deprecated
+    ``TrimTabDB.upsert_grammar``. One batch embed across all rules.
+    """
+    all_items: list[tuple[str, Any]] = []
+    for symbol_name in grammar.rule_names():
+        for entry in grammar.rules.get(symbol_name, []):
+            all_items.append((symbol_name, upgrade_entry(entry)))
+    if not all_items:
+        return
+    texts = [r.text for _, r in all_items]
+    vectors = await embedder.create_batch(texts)
+    for (symbol_name, rule_obj), vec in zip(all_items, vectors, strict=True):
+        db._put_rule_with_vector(grammar=grammar_name, symbol=symbol_name, rule=rule_obj, vector=vec)
 
 
 async def cmd_generate(args):
@@ -55,16 +72,15 @@ async def cmd_generate(args):
 
 
 async def cmd_add(args):
-    """Add an expansion to a rule."""
+    """Add a rule to a symbol."""
     db = _get_db(args)
     embedder = _get_embedder()
-    vec = await embedder.create(args.value)
     custom_id = getattr(args, "id", None) or None
-    db.add_expansion(args.grammar, args.rule, args.value, vec, id=custom_id)
-    msg = f"Added '{args.value}' to {args.grammar}:{args.rule}"
-    if custom_id:
-        msg += f" (id={custom_id})"
-    print(msg)
+    vec = await embedder.create(args.value)
+    from trimtab.grammar import Rule as TrimtabRule
+    rule = TrimtabRule(text=args.value, id=custom_id or "")
+    rule = db._put_rule_with_vector(grammar=args.grammar, symbol=args.rule, rule=rule, vector=vec)
+    print(f"Added '{args.value}' to {args.grammar}:{args.rule} (id={rule.id})")
 
 
 async def cmd_build(args):
@@ -75,8 +91,8 @@ async def cmd_build(args):
         texts = [line.strip() for line in f if line.strip()]
     grammar = await build_grammar(texts, embedder, min_count=args.min_count)
     name = args.name or Path(args.input).stem
-    await db.upsert_grammar(name, grammar, embedder)
-    print(f"Built and imported '{name}' ({len(grammar.rule_names())} rules)")
+    await _load_grammar_into_db(db, name, grammar, embedder)
+    print(f"Built and imported '{name}' ({len(grammar.rule_names())} symbols)")
 
 
 async def cmd_list(args):

@@ -11,7 +11,6 @@ from typing import Any
 import numpy as np
 import real_ladybug as lb
 
-from trimtab.embedder import Embedder
 from trimtab.grammar import Grammar, Rule
 
 logger = logging.getLogger(__name__)
@@ -512,145 +511,6 @@ class TrimTabDB:
             )
         return snapshot
 
-    async def upsert_grammar(self, name: str, grammar: Grammar, embedder: Embedder) -> None:
-        """DEPRECATED. Use TrimTab.load_file or TrimTab.put per entry.
-
-        Bulk-loads a Grammar by embedding all entries and writing them
-        through the v0.5 _put_rule_with_vector path.
-        """
-        import warnings
-        from trimtab.grammar import upgrade_entry
-
-        warnings.warn(
-            "TrimTabDB.upsert_grammar is deprecated. Use TrimTab.load_file() "
-            "or TrimTab.put() per rule in v0.5.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-        # Collect all entries across all symbols for one batch embed.
-        all_items: list[tuple[str, Rule]] = []  # (symbol_name, Rule)
-        for symbol_name in grammar.rule_names():
-            for entry in grammar.rules.get(symbol_name, []):
-                rule_obj = upgrade_entry(entry)
-                all_items.append((symbol_name, rule_obj))
-
-        if not all_items:
-            return
-
-        texts = [r.text for _, r in all_items]
-        vectors = await embedder.create_batch(texts)
-        for (symbol_name, rule_obj), vec in zip(all_items, vectors, strict=True):
-            self._put_rule_with_vector(
-                grammar=name,
-                symbol=symbol_name,
-                rule=rule_obj,
-                vector=vec,
-            )
-
-        logger.info("Upserted grammar '%s' with %d rules", name, len(grammar.rule_names()))
-
-    async def register_grammar(self, name: str, grammar: Grammar, embedder: Embedder) -> None:
-        """DEPRECATED. In v0.5, symbols are created lazily on first put.
-
-        Probes the embedder dimension and creates Grammar + Symbol nodes
-        for each rule_name in the grammar, but does not insert any
-        Rule entries (no embedding cost). Mostly preserved for callers
-        that want to pre-create the structure.
-        """
-        import warnings
-
-        warnings.warn(
-            "TrimTabDB.register_grammar is deprecated. In v0.5, symbols are "
-            "created lazily on the first TrimTab.put() call.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-        # Probe dimension via a single embed call so _ensure_rule_table can fire.
-        probe = await embedder.create("dimension probe")
-        self._ensure_rule_table(len(probe))
-
-        # Create Grammar + Symbol nodes (no rules).
-        self._conn.execute(
-            "MERGE (g:Grammar {name: $name})", {"name": name},
-        )
-        for sym_name in grammar.rule_names():
-            sym_id = f"{name}:{sym_name}"
-            self._conn.execute(
-                "MERGE (s:Symbol {id: $id}) "
-                "ON CREATE SET s.name = $n, s.grammar = $g",
-                {"id": sym_id, "n": sym_name, "g": name},
-            )
-            self._conn.execute(
-                "MATCH (g:Grammar), (s:Symbol) "
-                "WHERE g.name = $gname AND s.id = $sid "
-                "MERGE (g)-[:HAS_SYMBOL]->(s)",
-                {"gname": name, "sid": sym_id},
-            )
-
-        logger.info(
-            "Registered grammar '%s' with %d symbols (no rules)",
-            name,
-            len(grammar.rule_names()),
-        )
-
-    def add_expansion(
-        self,
-        grammar: str,
-        rule: str,  # in v0.4 this was the rule (now called symbol)
-        text: str,
-        embedding: list[float],
-        id: str | None = None,
-    ) -> None:
-        """DEPRECATED. Use TrimTab.put() in v0.5.
-
-        Note: the v0.4 ``rule`` parameter maps to the v0.5 ``symbol`` concept.
-        What v0.4 called an "expansion" is now called a "rule".
-        """
-        import warnings
-
-        warnings.warn(
-            "TrimTabDB.add_expansion is deprecated. In v0.5, use TrimTab.put(). "
-            "The 'rule' parameter here maps to the new 'symbol' concept; what "
-            "v0.4 called an 'expansion' is now called a 'rule'.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        rule_obj = Rule(text=text, id=id or "")
-        self._put_rule_with_vector(
-            grammar=grammar,
-            symbol=rule,
-            rule=rule_obj,
-            vector=embedding,
-        )
-
-    def query(
-        self,
-        grammar: str,
-        rule: str,
-        vector: list[float],
-        top_k: int = 5,
-    ) -> list[tuple[str, float, str]]:
-        """DEPRECATED. Use TrimTab.search() which returns full Rule objects.
-
-        Returns the v0.4 tuple shape: list of (text, score, id) tuples.
-        Score is a placeholder 1.0 because _search_rules doesn't surface
-        the cosine distance — for real scores, use the new TrimTab.search.
-        """
-        import warnings
-
-        warnings.warn(
-            "TrimTabDB.query is deprecated. Use TrimTab.search() which returns "
-            "full Rule objects including metadata.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        rules = self._search_rules(
-            grammar=grammar, symbol=rule, query_vector=vector, top_k=top_k,
-        )
-        return [(r.text, 1.0, r.id) for r in rules]
-
     def get_grammar(self, name: str) -> Grammar:
         """Export a grammar from the DB back to a Grammar object.
 
@@ -665,27 +525,6 @@ class TrimTabDB:
             rule_objs = self._get_rules(name, sym_name)
             rules[sym_name] = [r.text for r in rule_objs]
         return Grammar(rules=rules)
-
-    def get_expansions(self, grammar: str, rule: str) -> list[str]:
-        """DEPRECATED. Use TrimTab.list() which returns full Rule objects."""
-        import warnings
-
-        warnings.warn(
-            "TrimTabDB.get_expansions is deprecated. Use TrimTab.list().",
-            DeprecationWarning, stacklevel=2,
-        )
-        return [r.text for r in self._get_rules(grammar, rule)]
-
-    def list_entries(self, grammar: str, rule: str) -> list[tuple[str, str]]:
-        """DEPRECATED. Use TrimTab.list() which returns full Rule objects."""
-        import warnings
-
-        warnings.warn(
-            "TrimTabDB.list_entries is deprecated. Use TrimTab.list() which "
-            "returns Rule objects including metadata.",
-            DeprecationWarning, stacklevel=2,
-        )
-        return [(r.text, r.id) for r in self._get_rules(grammar, rule)]
 
     def list_grammars(self) -> list[str]:
         """List all grammar names in the DB."""
