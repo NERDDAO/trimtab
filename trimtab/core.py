@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 from trimtab.db import TrimTabDB
 from trimtab.embedder import Embedder
 from trimtab.grammar import Grammar, Rule, upgrade_entry
+from trimtab.retriever import CosineRetriever, Retriever
 
 if TYPE_CHECKING:  # avoid eager OllamaEmbedder import at module load
     pass
@@ -33,7 +34,12 @@ class TrimTab:
         tt = TrimTab(path=":memory:", embedder=...)     # bring your own
     """
 
-    def __init__(self, path: str = ":memory:", embedder: Embedder | None = None) -> None:
+    def __init__(
+        self,
+        path: str = ":memory:",
+        embedder: Embedder | None = None,
+        retriever: Retriever | None = None,
+    ) -> None:
         self._db = TrimTabDB(self._expand_path(path))
         # Resolve the embedder into a narrowed local so pyright can track its
         # type across the if-branch, then assign. Without this the attribute
@@ -48,6 +54,9 @@ class TrimTab:
         else:
             resolved = embedder
         self._embedder = resolved
+        # Default retriever preserves pre-hybrid behaviour: pure cosine over
+        # the LadybugDB HNSW index with brute-force fallback.
+        self._retriever: Retriever = retriever or CosineRetriever()
 
     @staticmethod
     def _expand_path(path: str) -> str:
@@ -174,11 +183,13 @@ class TrimTab:
         if self._db._count_rules(grammar, symbol) == 0:
             return []
         query_vector = await self._embedder.create(query)
-        return self._db._search_rules(
-            grammar=grammar,
-            symbol=symbol,
-            query_vector=query_vector,
+        return await self._retriever.search(
+            self._db,
+            grammar,
+            symbol,
+            query,
             top_k=top_k,
+            query_vector=query_vector,
         )
 
     async def generate(

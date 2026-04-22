@@ -6,7 +6,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import real_ladybug as lb
@@ -14,6 +14,11 @@ import real_ladybug as lb
 from trimtab.grammar import Grammar, Rule
 
 logger = logging.getLogger(__name__)
+
+
+# Type alias: listeners are called with (grammar, symbol_or_none). ``None``
+# means "every symbol under this grammar is stale" (e.g. on _drop_grammar).
+InvalidationListener = Callable[[str, str | None], None]
 
 
 class TrimTabDB:
@@ -42,6 +47,7 @@ class TrimTabDB:
         self._conn = lb.Connection(self._db)
         self._init_vector_extension()
         self._embedding_dim: int | None = None
+        self._invalidation_listeners: list[InvalidationListener] = []
         # Migration MUST run before _init_schema. The migration's detector
         # checks whether a Symbol table already exists and treats its
         # presence as "DB is already v0.5". If _init_schema ran first and
@@ -56,6 +62,26 @@ class TrimTabDB:
         # If a Rule table exists (fresh-after-migration or previously-used v0.5),
         # probe its embedding dimension so subsequent puts respect it.
         self._embedding_dim = self._probe_existing_rule_dim()
+
+    def register_invalidation_listener(self, listener: InvalidationListener) -> None:
+        """Register a callback invoked on any mutation under (grammar, symbol).
+
+        Retrievers that maintain auxiliary indexes (e.g. BM25 in the hybrid
+        retriever) register here to drop cached state when the underlying
+        rules change. The callback is invoked with ``(grammar, symbol)`` for
+        per-slice mutations and ``(grammar, None)`` for whole-grammar drops.
+        """
+        if listener not in self._invalidation_listeners:
+            self._invalidation_listeners.append(listener)
+
+    def _emit_invalidation(self, grammar: str, symbol: str | None) -> None:
+        for listener in self._invalidation_listeners:
+            try:
+                listener(grammar, symbol)
+            except Exception:
+                # A misbehaving listener must never break a write. Swallow
+                # and move on; logging at debug to keep test output clean.
+                logger.debug("Invalidation listener failed", exc_info=True)
 
     def _init_schema(self) -> None:
         """Create v0.5 node and relationship tables if they don't exist."""
@@ -224,6 +250,7 @@ class TrimTabDB:
             "MERGE (s)-[:HAS_RULE]->(r)",
             {"sid": sym_id, "rid": rule.id},
         )
+        self._emit_invalidation(grammar, symbol)
         return rule
 
     def _get_rules(self, grammar: str, symbol: str) -> list[Rule]:
@@ -329,6 +356,7 @@ class TrimTabDB:
             "MERGE (s)-[:HAS_RULE]->(r)",
             {"sid": sym_id, "rid": rule_id},
         )
+        self._emit_invalidation(grammar, symbol)
 
     def _remove_rule(self, grammar: str, symbol: str, rule_id: str) -> None:
         """Hard-delete a Rule by id. Raises TrimTabNotFoundError if missing."""
@@ -345,6 +373,7 @@ class TrimTabDB:
             "MATCH (r:Rule) WHERE r.id = $id DETACH DELETE r",
             {"id": rule_id},
         )
+        self._emit_invalidation(grammar, symbol)
 
     def _clear_symbol(self, grammar: str, symbol: str) -> None:
         """Remove all Rules under (grammar, symbol). Leaves the Symbol node intact."""
@@ -352,6 +381,7 @@ class TrimTabDB:
             "MATCH (r:Rule) WHERE r.grammar = $g AND r.symbol = $s DETACH DELETE r",
             {"g": grammar, "s": symbol},
         )
+        self._emit_invalidation(grammar, symbol)
 
     def _drop_grammar(self, grammar: str) -> None:
         """Remove all Rules, Symbols, and the Grammar node for a grammar."""
@@ -367,6 +397,7 @@ class TrimTabDB:
             "MATCH (g:Grammar) WHERE g.name = $g_name DETACH DELETE g",
             {"g_name": grammar},
         )
+        self._emit_invalidation(grammar, None)
 
     def _search_rules(
         self,

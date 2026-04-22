@@ -6,6 +6,7 @@ from typing import NamedTuple
 
 from trimtab.grammar import Grammar, Rule
 from trimtab.embedder import Embedder
+from trimtab.retriever import CosineRetriever, Retriever
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +33,19 @@ class GenerationResult(NamedTuple):
 class Generator:
     """Generate text from a grammar in TrimTabDB using cascading embedding search."""
 
-    def __init__(self, db, grammar: str, embedder: Embedder):
+    def __init__(
+        self,
+        db,
+        grammar: str,
+        embedder: Embedder,
+        retriever: Retriever | None = None,
+    ):
         from trimtab.db import TrimTabDB
 
         self._db: TrimTabDB = db
         self._grammar = grammar
         self._embedder = embedder
+        self._retriever: Retriever = retriever or CosineRetriever()
 
     async def generate(
         self,
@@ -172,7 +180,14 @@ class Generator:
             return rng.choice(expansions), "", None
 
         context_vec = await self._embedder.create(context)
-        rule_objs = self._db._search_rules(self._grammar, rule, context_vec, top_k=top_k)
+        rule_objs = await self._retriever.search(
+            self._db,
+            self._grammar,
+            rule,
+            context,
+            top_k=top_k,
+            query_vector=context_vec,
+        )
 
         if not rule_objs:
             if min_confidence > 0:
