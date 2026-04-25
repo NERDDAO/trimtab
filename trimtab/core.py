@@ -23,7 +23,7 @@ from trimtab.grammar import Grammar, Rule, upgrade_entry
 from trimtab.retriever import CosineRetriever, Retriever
 
 if TYPE_CHECKING:  # avoid eager OllamaEmbedder import at module load
-    pass
+    from trimtab.generator import AuxProvider
 
 
 class TrimTab:
@@ -50,6 +50,7 @@ class TrimTab:
             # Lazy import so TrimTab can be constructed in test environments
             # without Ollama as long as the caller supplies an embedder.
             from trimtab.embedders import OllamaEmbedder
+
             resolved = OllamaEmbedder()  # may raise TrimTabEmbedderError
         else:
             resolved = embedder
@@ -202,15 +203,26 @@ class TrimTab:
         top_k: int = 5,
         min_confidence: float = 0.0,
         no_match_text: str = "",
+        aux_provider: "AuxProvider | None" = None,
     ):
         """Tracery-style walk with cascading embedding-based selection.
 
         Returns a ``GenerationResult`` with ``text``, ``ids`` (walk order),
         and ``rules_used`` (full Rule objects). Raises ``TrimTabCycleError``
         if the grammar has a cyclic symbol reference.
+
+        ``aux_provider`` (Phase 2 of v24) optionally injects per-symbol
+        auxiliary rankings and/or a candidate subset into each cascaded
+        retriever call. Defaults to ``None`` — backwards compatible.
         """
         from trimtab.generator import Generator
-        gen = Generator(db=self._db, grammar=grammar, embedder=self._embedder)
+
+        gen = Generator(
+            db=self._db,
+            grammar=grammar,
+            embedder=self._embedder,
+            aux_provider=aux_provider,
+        )
         return await gen.generate(
             context=context,
             origin=origin,

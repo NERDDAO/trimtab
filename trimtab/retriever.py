@@ -41,12 +41,19 @@ class Retriever(Protocol):
         *,
         top_k: int,
         query_vector: list[float] | None = None,
+        auxiliary_rankings: list[list[str]] | None = None,
+        candidate_subset: list[str] | None = None,
     ) -> list[Rule]:
         """Return up to ``top_k`` rules ranked by relevance (best first).
 
         ``query_vector`` is supplied by the caller so the embedding cost is
         paid once at the cascade level rather than per retriever call.
         Implementations that need a vector (dense, hybrid) must accept it.
+
+        ``auxiliary_rankings`` and ``candidate_subset`` are optional inputs
+        for fusion-capable retrievers (see :class:`HybridRetriever`). Dense-
+        only implementations must accept the kwargs to satisfy this Protocol
+        but may silently ignore them.
         """
         ...
 
@@ -67,7 +74,13 @@ class CosineRetriever:
         *,
         top_k: int,
         query_vector: list[float] | None = None,
+        auxiliary_rankings: list[list[str]] | None = None,
+        candidate_subset: list[str] | None = None,
     ) -> list[Rule]:
+        """``auxiliary_rankings`` and ``candidate_subset`` are accepted to match the
+        Retriever protocol; CosineRetriever is dense-only and does not consume them.
+        """
+        del auxiliary_rankings, candidate_subset  # explicit no-op for protocol parity
         if query_vector is None:
             raise ValueError("CosineRetriever requires a precomputed query_vector")
         return db._search_rules(grammar, symbol, query_vector, top_k)
@@ -221,7 +234,25 @@ class HybridRetriever:
         *,
         top_k: int,
         query_vector: list[float] | None = None,
+        auxiliary_rankings: list[list[str]] | None = None,
+        candidate_subset: list[str] | None = None,
     ) -> list[Rule]:
+        """Dense + BM25 + optional auxiliary rankings, fused via RRF.
+
+        ``auxiliary_rankings`` — caller-computed ranked rule-id lists that
+        represent additional signals (e.g. person-name hits, temporal
+        proximity, engram-propagation from a sibling grammar). Each ranking
+        is RRF-fused alongside dense + sparse. Empty list or ``None`` falls
+        back to pure dense+BM25 behaviour. Unknown ids are silently dropped
+        during rule hydration — callers own the validity contract.
+
+        ``candidate_subset`` — optional pre-flight filter. When provided,
+        every input ranking (dense, sparse, auxiliary) is post-filtered to
+        ids in the subset before RRF fusion. Lets callers narrow retrieval
+        to a query-relevant shortlist (e.g. from :class:`~trimtab.engram.
+        EngramIndex.lookup`) while keeping the full scoring stack. An empty
+        subset yields an empty result — callers own fallback to full-pool.
+        """
         if query_vector is None:
             raise ValueError("HybridRetriever requires a precomputed query_vector")
 
@@ -245,7 +276,22 @@ class HybridRetriever:
                 state.corpus_ids[i] for i in ranked_indices if scores[i] > 0.0
             ]
 
-        fused = reciprocal_rank_fusion([dense_ids, sparse_ids], k=self._rrf_k)
+        if candidate_subset is not None:
+            subset = set(candidate_subset)
+            if not subset:
+                return []
+            dense_ids = [i for i in dense_ids if i in subset]
+            sparse_ids = [i for i in sparse_ids if i in subset]
+            if auxiliary_rankings:
+                auxiliary_rankings = [
+                    [i for i in r if i in subset] for r in auxiliary_rankings
+                ]
+
+        all_rankings: list[list[str]] = [dense_ids, sparse_ids]
+        if auxiliary_rankings:
+            all_rankings.extend(r for r in auxiliary_rankings if r)
+
+        fused = reciprocal_rank_fusion(all_rankings, k=self._rrf_k)
 
         dense_by_id = {r.id: r for r in dense_rules}
         # Hydrate fused rule ids into Rule objects, keeping fused order for now.

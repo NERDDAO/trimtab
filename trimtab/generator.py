@@ -2,6 +2,7 @@
 
 import logging
 import random
+from collections.abc import Awaitable, Callable
 from typing import NamedTuple
 
 from trimtab.grammar import Grammar, Rule
@@ -9,6 +10,22 @@ from trimtab.embedder import Embedder
 from trimtab.retriever import CosineRetriever, Retriever
 
 logger = logging.getLogger(__name__)
+
+
+# ``AuxProvider`` is the cascade-walk hook that lets callers inject per-symbol
+# auxiliary rankings and/or candidate subsets into the retriever call. The
+# closure is invoked by ``Generator._select`` once per cascaded symbol with
+# ``(symbol_name, context, context_vec)``. Either element of the returned
+# tuple may be ``None`` to opt-out of that signal for the current symbol.
+#
+# Phase 2 of v24 wires the plumbing; Phase 3+ light up real per-symbol bridge
+# propagators on top of this contract. When ``aux_provider`` is ``None`` the
+# generator preserves byte-identical behaviour with the pre-v24 cascade walk
+# (no new kwargs threaded into ``Retriever.search``).
+AuxProvider = Callable[
+    [str, str, list[float]],
+    Awaitable[tuple[list[list[str]] | None, list[str] | None]],
+]
 
 
 class GenerationResult(NamedTuple):
@@ -39,6 +56,7 @@ class Generator:
         grammar: str,
         embedder: Embedder,
         retriever: Retriever | None = None,
+        aux_provider: AuxProvider | None = None,
     ):
         from trimtab.db import TrimTabDB
 
@@ -46,6 +64,11 @@ class Generator:
         self._grammar = grammar
         self._embedder = embedder
         self._retriever: Retriever = retriever or CosineRetriever()
+        # Phase 2 of v24: optional per-symbol AuxProvider for the cascade walk.
+        # When ``None`` (the default), ``_select`` calls ``retriever.search``
+        # with exactly the historical kwarg set — no auxiliary_rankings, no
+        # candidate_subset — preserving byte-identical pre-v24 behaviour.
+        self._aux_provider: AuxProvider | None = aux_provider
 
     async def generate(
         self,
@@ -80,8 +103,15 @@ class Generator:
         """
         rng = random.Random(seed)
         text, ids, rules_used = await self._expand(
-            origin, context, temperature, rng, top_k,
-            min_confidence, no_match_text, depth=0, visit_stack=[],
+            origin,
+            context,
+            temperature,
+            rng,
+            top_k,
+            min_confidence,
+            no_match_text,
+            depth=0,
+            visit_stack=[],
         )
         return GenerationResult(text=text, ids=ids, rules_used=rules_used)
 
@@ -121,7 +151,14 @@ class Generator:
         expansions = [r.text for r in rule_objs]
 
         chosen_text, chosen_id, chosen_rule = await self._select(
-            rule, context, expansions, temperature, rng, top_k, min_confidence, no_match_text
+            rule,
+            context,
+            expansions,
+            temperature,
+            rng,
+            top_k,
+            min_confidence,
+            no_match_text,
         )
 
         result = chosen_text
@@ -180,14 +217,33 @@ class Generator:
             return rng.choice(expansions), "", None
 
         context_vec = await self._embedder.create(context)
-        rule_objs = await self._retriever.search(
-            self._db,
-            self._grammar,
-            rule,
-            context,
-            top_k=top_k,
-            query_vector=context_vec,
-        )
+
+        if self._aux_provider is None:
+            # Pre-v24 path — do NOT pass the new kwargs at all so byte-for-byte
+            # call equivalence is preserved (matters for fakes that assert on
+            # exact kwarg sets, and for HybridRetriever's cache-hit path).
+            rule_objs = await self._retriever.search(
+                self._db,
+                self._grammar,
+                rule,
+                context,
+                top_k=top_k,
+                query_vector=context_vec,
+            )
+        else:
+            aux_rankings, cand_subset = await self._aux_provider(
+                rule, context, context_vec
+            )
+            rule_objs = await self._retriever.search(
+                self._db,
+                self._grammar,
+                rule,
+                context,
+                top_k=top_k,
+                query_vector=context_vec,
+                auxiliary_rankings=aux_rankings,
+                candidate_subset=cand_subset,
+            )
 
         if not rule_objs:
             if min_confidence > 0:
