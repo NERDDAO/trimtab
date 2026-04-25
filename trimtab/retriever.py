@@ -59,11 +59,33 @@ class Retriever(Protocol):
 
 
 class CosineRetriever:
-    """Pure cosine similarity via LadybugDB HNSW with brute-force fallback.
+    """Dense cosine + optional auxiliary RRF + optional candidate subset filter.
 
-    Behaviour is identical to the pre-hybrid default path: the underlying
-    call site is ``TrimTabDB._search_rules``.
+    Default cascade-walk retriever: lighter weight than :class:`HybridRetriever`
+    (no BM25, no cross-encoder rerank) but still consumes the v24 P2 fusion
+    kwargs so callers can inject auxiliary signals from the unified retrieval
+    kernel without paying HybridRetriever's per-step fan-out cost.
+
+    Behaviour matrix:
+
+    * ``auxiliary_rankings is None`` (or empty) **and** ``candidate_subset is
+      None``: byte-equivalent to the pre-v24 pure-dense path — delegates to
+      ``TrimTabDB._search_rules``.
+    * ``candidate_subset`` non-empty: dense candidates are filtered to the
+      subset before any fusion. Unknown ids in the subset are silently dropped
+      (caller owns the validity contract).
+    * ``candidate_subset`` empty (``[]``): short-circuits to ``[]`` — same
+      semantics as :class:`HybridRetriever` (no fallback to full pool).
+    * ``auxiliary_rankings`` non-empty: RRF-fused with the dense ranking using
+      the same default ``k=60`` constant as :class:`HybridRetriever`.
+
+    Cross-encoder rerank stays a HybridRetriever-only concern by design — the
+    cascade default needs to keep latency low across many ``_expand`` steps.
     """
+
+    def __init__(self, candidate_multiplier: int = 4, rrf_k: int = 60):
+        self._candidate_multiplier = candidate_multiplier
+        self._rrf_k = rrf_k
 
     async def search(
         self,
@@ -77,13 +99,76 @@ class CosineRetriever:
         auxiliary_rankings: list[list[str]] | None = None,
         candidate_subset: list[str] | None = None,
     ) -> list[Rule]:
-        """``auxiliary_rankings`` and ``candidate_subset`` are accepted to match the
-        Retriever protocol; CosineRetriever is dense-only and does not consume them.
+        """Dense cosine top-K, optionally fused with auxiliary rankings via RRF.
+
+        See class docstring for the full behaviour matrix. Implementation note:
+        when neither fusion kwarg is in play we take the same code path the
+        pre-v24 default did, so the bytes-equivalence regression bench stays
+        green.
         """
-        del auxiliary_rankings, candidate_subset  # explicit no-op for protocol parity
         if query_vector is None:
             raise ValueError("CosineRetriever requires a precomputed query_vector")
-        return db._search_rules(grammar, symbol, query_vector, top_k)
+
+        has_aux = bool(auxiliary_rankings)
+        has_subset = candidate_subset is not None
+
+        # Fast path: no fusion, no filter — preserve historical behaviour exactly.
+        if not has_aux and not has_subset:
+            return db._search_rules(grammar, symbol, query_vector, top_k)
+
+        # Empty subset short-circuits to no results (mirrors HybridRetriever).
+        if has_subset and not candidate_subset:
+            return []
+
+        # Pull a wider dense pool when we're about to fuse / filter so RRF has
+        # something to work with after the subset trim.
+        candidate_k = max(top_k * self._candidate_multiplier, top_k)
+        dense_rules = db._search_rules(grammar, symbol, query_vector, candidate_k)
+        rules_by_id: dict[str, Rule] = {r.id: r for r in dense_rules}
+        dense_ids = [r.id for r in dense_rules]
+
+        if has_subset:
+            subset = set(candidate_subset or [])
+            dense_ids = [i for i in dense_ids if i in subset]
+            if has_aux and auxiliary_rankings is not None:
+                auxiliary_rankings = [
+                    [i for i in r if i in subset] for r in auxiliary_rankings
+                ]
+
+        # No auxiliary signal — dense ranking (filtered by subset) is the answer.
+        if not has_aux:
+            return [rules_by_id[i] for i in dense_ids[:top_k] if i in rules_by_id]
+
+        # Hydrate aux-only ids that dense didn't surface so the fused ranking
+        # can promote them. Mirrors HybridRetriever, which hydrates from its
+        # cached BM25 corpus state (the full rule pool under the slice).
+        needed_ids: set[str] = set()
+        for r in auxiliary_rankings or []:
+            for rid in r:
+                if rid not in rules_by_id:
+                    needed_ids.add(rid)
+        if needed_ids:
+            for rule in db._get_rules(grammar, symbol):
+                if rule.id in needed_ids:
+                    rules_by_id[rule.id] = rule
+
+        all_rankings: list[list[str]] = [dense_ids]
+        if auxiliary_rankings:
+            all_rankings.extend(r for r in auxiliary_rankings if r)
+
+        fused = reciprocal_rank_fusion(all_rankings, k=self._rrf_k)
+
+        out: list[Rule] = []
+        for rid, _score in fused:
+            rule = rules_by_id.get(rid)
+            if rule is None:
+                # Aux id that's unknown to the DB — caller owns the validity
+                # contract; drop silently as the spec requires.
+                continue
+            out.append(rule)
+            if len(out) >= top_k:
+                break
+        return out
 
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
