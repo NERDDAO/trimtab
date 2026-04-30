@@ -281,7 +281,7 @@ class Generator:
             # net so the cascade's chosen rule is likely in the top-K;
             # find it by id and use its score.
             qs_results = self._db._search_rules(
-                self._grammar, rule, query_vec, top_k=50
+                self._grammar, rule, query_vec, top_k=10
             )
             for r in qs_results:
                 if r.id == chosen_rule.id:
@@ -360,7 +360,7 @@ class Generator:
             ):
                 child_chosen_id = child_pick[2].id
                 cs_results = self._db._search_rules(
-                    self._grammar, ref, query_vec, top_k=50
+                    self._grammar, ref, query_vec, top_k=10
                 )
                 for r in cs_results:
                     if r.id == child_chosen_id:
