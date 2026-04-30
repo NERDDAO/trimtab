@@ -80,6 +80,7 @@ class Generator:
         min_confidence: float = 0.0,
         no_match_text: str = "",
         descent_margin: float = 0.05,
+        confidence_gap: float = 0.0,
     ) -> GenerationResult:
         """Generate text by cascading context through the grammar tree.
 
@@ -122,6 +123,25 @@ class Generator:
                 so any non-trivial RRF gap easily clears the budget —
                 the same margin is more aggressive under hybrid.
 
+            confidence_gap: Companion walk-stop heuristic to
+                ``descent_margin``. Catches the "flat-score uncertain pick"
+                failure mode where every cascade level scores comparably
+                (so ``descent_margin`` never fires) but the chosen leaf is
+                a coin-flip among the top-K. Concretely: after ``_select``
+                returns the chosen rule, if ``len(rule_objs) >= 2`` AND
+                ``rule_objs[0].score - rule_objs[1].score < confidence_gap``,
+                the pick is deemed non-confident and the walk truncates at
+                the current symbol — the ``#ref#`` recursion loop is
+                skipped, leaving any literal ``#child#`` tokens in the
+                output. The current symbol's text/id/rule still land in
+                ``result``, so cascade_text remains non-empty.
+
+                Default ``0.0`` is "off" — the comparison
+                ``gap < 0.0`` never holds, preserving byte-identical
+                pre-feature behaviour. Tune up to ~0.05 cosine to filter
+                near-tie picks. Composes with ``descent_margin``: either
+                heuristic firing independently stops the walk.
+
         Returns:
             ``GenerationResult(text, ids)`` where ``ids`` are the expansion
             ids walked through during the cascade. Empty rules and no-match
@@ -137,6 +157,7 @@ class Generator:
             min_confidence,
             no_match_text,
             descent_margin,
+            confidence_gap,
             depth=0,
             visit_stack=[],
         )
@@ -152,9 +173,12 @@ class Generator:
         min_confidence: float,
         no_match_text: str,
         descent_margin: float,
+        confidence_gap: float,
         depth: int,
         visit_stack: list[str] | None = None,
-        preselected: tuple[str, str, Rule | None, float | None] | None = None,
+        preselected: (
+            tuple[str, str, Rule | None, float | None, float | None] | None
+        ) = None,
     ) -> tuple[str, list[str], list[Rule]]:
         """Recursively expand a symbol with cascading context.
 
@@ -165,6 +189,8 @@ class Generator:
         ``preselected`` lets the caller skip the inner ``_select`` call when
         a pick was already made (e.g. by the walk-stop peek in the parent's
         recursion loop). When ``None``, ``_expand`` does its own ``_select``.
+        Tuple shape matches ``_select``'s 5-tuple return:
+        ``(text, id, rule, score, runner_up_score)``.
         """
         from trimtab.errors import TrimTabCycleError
 
@@ -178,7 +204,13 @@ class Generator:
             return f"[{rule}]", [], []
 
         if preselected is not None:
-            chosen_text, chosen_id, chosen_rule, _chosen_score = preselected
+            (
+                chosen_text,
+                chosen_id,
+                chosen_rule,
+                _chosen_score,
+                runner_up_score,
+            ) = preselected
         else:
             # Fetch rules via the new v0.5 path (was: self._db.get_expansions).
             rule_objs = self._db._get_rules(self._grammar, rule)
@@ -186,7 +218,13 @@ class Generator:
                 return f"[{rule}]", [], []
             expansions = [r.text for r in rule_objs]
 
-            chosen_text, chosen_id, chosen_rule, _chosen_score = await self._select(
+            (
+                chosen_text,
+                chosen_id,
+                chosen_rule,
+                _chosen_score,
+                runner_up_score,
+            ) = await self._select(
                 rule,
                 context,
                 expansions,
@@ -207,6 +245,40 @@ class Generator:
         walk_ids: list[str] = [chosen_id] if chosen_id else []
         walk_rules: list[Rule] = [chosen_rule] if chosen_rule is not None else []
         refs = Grammar.extract_refs(chosen_text)
+
+        # Confidence-gap walk-stop (companion to descent_margin).
+        #
+        # Catches the "flat-score uncertain pick" failure mode: every cascade
+        # level scores comparably (so descent_margin never trips) but the
+        # chosen leaf is a coin-flip among the top-K. When the gap between
+        # top-1 and top-2 is below ``confidence_gap``, we treat the pick as
+        # non-confident and skip the ref recursion — the chosen text/id/rule
+        # still land in ``result``, but no child symbols are walked.
+        #
+        # Edge cases:
+        # * ``confidence_gap == 0.0`` (default) → ``gap < 0.0`` never holds,
+        #   so this branch is dead → byte-identical pre-feature behaviour.
+        # * Missing scores (random fallback, single-rule symbols, no-context
+        #   paths) → ``parent_score is None`` or ``runner_up_score is None``
+        #   → falls through to "always descend" (back-compat).
+        if (
+            confidence_gap > 0.0
+            and parent_score is not None
+            and runner_up_score is not None
+            and (parent_score - runner_up_score) < confidence_gap
+        ):
+            logger.info(
+                "walk stopped at symbol=%s (non-confident pick: top1=%.4f, top2=%.4f, gap=%.4f < %.4f)",
+                rule,
+                parent_score,
+                runner_up_score,
+                parent_score - runner_up_score,
+                confidence_gap,
+            )
+            # Skip the ref recursion entirely — leave any literal #child#
+            # tokens in ``result``. walk_ids/walk_rules already carry only
+            # the parent symbol's pick.
+            return result, walk_ids, walk_rules
 
         for ref in refs:
             cascaded_context = f"{context} {result}" if context else result
@@ -279,6 +351,7 @@ class Generator:
                     min_confidence,
                     no_match_text,
                     descent_margin,
+                    confidence_gap,
                     depth + 1,
                     visit_stack=visit_stack,
                 )
@@ -293,6 +366,7 @@ class Generator:
                     min_confidence,
                     no_match_text,
                     descent_margin,
+                    confidence_gap,
                     depth + 1,
                     visit_stack=visit_stack,
                     preselected=child_pick,
@@ -312,10 +386,10 @@ class Generator:
         top_k: int,
         min_confidence: float,
         no_match_text: str,
-    ) -> tuple[str, str, Rule | None, float | None] | None:
+    ) -> tuple[str, str, Rule | None, float | None, float | None] | None:
         """Run a ``_select`` against ``symbol`` for the walk-stop peek.
 
-        Returns the same 4-tuple ``_select`` does, or ``None`` if the symbol
+        Returns the same 5-tuple ``_select`` does, or ``None`` if the symbol
         has no rules at all (so the caller can fall back to its historical
         placeholder path).
         """
@@ -344,16 +418,22 @@ class Generator:
         top_k: int,
         min_confidence: float = 0.0,
         no_match_text: str = "",
-    ) -> tuple[str, str, Rule | None, float | None]:
+    ) -> tuple[str, str, Rule | None, float | None, float | None]:
         """Select an expansion using embedding similarity + temperature.
 
-        Returns ``(text, id, rule, score)`` — the chosen expansion text,
-        its id from the DB, the full ``Rule`` object (or ``None`` for
-        random / no-context fallback paths that don't go through a DB rule
-        lookup), and the rule's transient retrieval score (or ``None`` for
-        fallback paths). The score is the raw cosine for ``CosineRetriever``,
-        the fused RRF score for ``HybridRetriever``, or the cross-encoder
-        score when one is configured.
+        Returns ``(text, id, rule, score, runner_up_score)`` — the chosen
+        expansion text, its id from the DB, the full ``Rule`` object (or
+        ``None`` for random / no-context fallback paths that don't go
+        through a DB rule lookup), the rule's transient retrieval score
+        (or ``None`` for fallback paths), and the runner-up's score when
+        the retriever returned >= 2 candidates (else ``None``).
+
+        ``runner_up_score`` is what the confidence-gap walk-stop heuristic
+        in ``_expand`` uses to detect "flat-score uncertain pick" cases.
+        It is the score of ``rule_objs[1]`` when present, regardless of
+        which candidate ``_select`` actually picked (top-1 vs. sampled),
+        because the heuristic measures the SHAPE of the score distribution
+        not the specific pick.
         """
         if len(expansions) == 1:
             # Single-expansion symbol — fetch the rule directly to get its id.
@@ -375,16 +455,17 @@ class Generator:
                     )
                     if scored:
                         top = scored[0]
-                        return top.text, top.id, top, top.score
-                return rule_objs[0].text, rule_objs[0].id, rule_objs[0], None
-            return expansions[0], "", None, None
+                        # Single-rule symbol → no runner-up by construction.
+                        return top.text, top.id, top, top.score, None
+                return rule_objs[0].text, rule_objs[0].id, rule_objs[0], None, None
+            return expansions[0], "", None, None, None
 
         if temperature >= 1.0:
             # Fully random — pick an arbitrary expansion with no id tracking.
-            return rng.choice(expansions), "", None, None
+            return rng.choice(expansions), "", None, None, None
 
         if not context:
-            return rng.choice(expansions), "", None, None
+            return rng.choice(expansions), "", None, None, None
 
         context_vec = await self._embedder.create(context)
 
@@ -417,13 +498,20 @@ class Generator:
 
         if not rule_objs:
             if min_confidence > 0:
-                return no_match_text, "", None, None
-            return rng.choice(expansions), "", None, None
+                return no_match_text, "", None, None, None
+            return rng.choice(expansions), "", None, None, None
+
+        # Runner-up score is the second-best returned candidate's score, used
+        # by the confidence-gap walk-stop heuristic to detect flat-score
+        # fields. ``None`` when the retriever returned only one candidate.
+        runner_up_score: float | None = (
+            rule_objs[1].score if len(rule_objs) >= 2 else None
+        )
 
         # Temperature == 0: top-1 (deterministic).
         if temperature <= 0.0:
             top = rule_objs[0]
-            return top.text, top.id, top, top.score
+            return top.text, top.id, top, top.score, runner_up_score
 
         # Temperature > 0: uniform sample from the top-k. (Real weighted
         # sampling by cosine score is a v0.6+ improvement — the new
@@ -432,8 +520,8 @@ class Generator:
             # Without scores we can't filter by confidence. Fall through to
             # the no-match path if there's nothing to sample.
             if not rule_objs:
-                return no_match_text, "", None, None
+                return no_match_text, "", None, None, None
 
         idx = rng.randrange(len(rule_objs))
         picked = rule_objs[idx]
-        return picked.text, picked.id, picked, picked.score
+        return picked.text, picked.id, picked, picked.score, runner_up_score
