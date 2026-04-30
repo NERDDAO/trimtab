@@ -112,9 +112,15 @@ class CosineRetriever:
         has_aux = bool(auxiliary_rankings)
         has_subset = candidate_subset is not None
 
+        import asyncio
+
         # Fast path: no fusion, no filter — preserve historical behaviour exactly.
+        # _search_rules → ladybug C++ binding (no GIL release). Wrap in to_thread
+        # so concurrent retrievers across asyncio TaskGroup lanes don't serialize.
         if not has_aux and not has_subset:
-            return db._search_rules(grammar, symbol, query_vector, top_k)
+            return await asyncio.to_thread(
+                db._search_rules, grammar, symbol, query_vector, top_k
+            )
 
         # Empty subset short-circuits to no results (mirrors HybridRetriever).
         if has_subset and not candidate_subset:
@@ -123,7 +129,9 @@ class CosineRetriever:
         # Pull a wider dense pool when we're about to fuse / filter so RRF has
         # something to work with after the subset trim.
         candidate_k = max(top_k * self._candidate_multiplier, top_k)
-        dense_rules = db._search_rules(grammar, symbol, query_vector, candidate_k)
+        dense_rules = await asyncio.to_thread(
+            db._search_rules, grammar, symbol, query_vector, candidate_k
+        )
         rules_by_id: dict[str, Rule] = {r.id: r for r in dense_rules}
         dense_ids = [r.id for r in dense_rules]
 
@@ -349,7 +357,16 @@ class HybridRetriever:
 
         candidate_k = max(top_k * self._candidate_multiplier, top_k)
 
-        dense_rules = db._search_rules(grammar, symbol, query_vector, candidate_k)
+        # _search_rules → ladybug C++ binding (no GIL release). Wrap in
+        # to_thread so concurrent retrievers across asyncio TaskGroup lanes
+        # don't serialize. The chunks lane was the worst offender — its
+        # sync ladybug call starved Neo4j AsyncDriver-using KG lanes,
+        # inflating taskgroup_overhead by ~4s.
+        import asyncio
+
+        dense_rules = await asyncio.to_thread(
+            db._search_rules, grammar, symbol, query_vector, candidate_k
+        )
         dense_ids = [r.id for r in dense_rules]
 
         state = self._state_for(db, grammar, symbol)
