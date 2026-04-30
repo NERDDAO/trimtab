@@ -81,6 +81,7 @@ class Generator:
         no_match_text: str = "",
         descent_margin: float = 0.05,
         confidence_gap: float = 0.0,
+        query_vec: list[float] | None = None,
     ) -> GenerationResult:
         """Generate text by cascading context through the grammar tree.
 
@@ -142,6 +143,30 @@ class Generator:
                 near-tie picks. Composes with ``descent_margin``: either
                 heuristic firing independently stops the walk.
 
+            query_vec: Optional pre-computed embedding of the *raw* user
+                query. When supplied AND ``descent_margin > 0``, the
+                walk-stop comparison switches from context-anchored
+                scoring (each level's chosen rule scored against the
+                growing ``cascaded_context``) to query-anchored scoring
+                (best score at current symbol vs. raw query, compared to
+                best score at child symbol vs. raw query).
+
+                Why: ``cascaded_context`` accumulates the chosen text from
+                each level, so deeper symbols are scored against a vector
+                that increasingly resembles their own grammar text — child
+                scores *always* inflate, defeating the "stop iff child
+                worse than parent" semantic. With ``query_vec``, both
+                parent and child are scored against the same fixed anchor
+                (the user's question), so the comparison is
+                apples-to-apples.
+
+                Default ``None`` falls back to context-anchored scoring
+                (preserves pre-feature behaviour). Pass the raw query's
+                embedding once at the top of the walk; this method makes
+                two extra ``_search_rules`` calls per level (one for the
+                current symbol, one per child ref) — cheap HNSW lookups,
+                ~5-20ms each.
+
         Returns:
             ``GenerationResult(text, ids)`` where ``ids`` are the expansion
             ids walked through during the cascade. Empty rules and no-match
@@ -158,6 +183,7 @@ class Generator:
             no_match_text,
             descent_margin,
             confidence_gap,
+            query_vec,
             depth=0,
             visit_stack=[],
         )
@@ -174,6 +200,7 @@ class Generator:
         no_match_text: str,
         descent_margin: float,
         confidence_gap: float,
+        query_vec: list[float] | None,
         depth: int,
         visit_stack: list[str] | None = None,
         preselected: (
@@ -236,10 +263,21 @@ class Generator:
             )
 
         # Score for this symbol's chosen rule (used by the walk-stop check
-        # before recursing into each child ref).
+        # before recursing into each child ref). When ``query_vec`` is
+        # supplied, walk-stop uses the BEST score at this symbol against
+        # the RAW query (apples-to-apples comparison across levels) rather
+        # than the chosen rule's context-anchored score. The cascade walk
+        # naturally inflates context-anchored scores at deeper symbols
+        # because ``cascaded_context`` grows with each chosen rule's text;
+        # using a fixed query anchor removes that bias and makes the
+        # "child must be more relevant than parent" semantic meaningful.
         parent_score: float | None = (
             chosen_rule.score if chosen_rule is not None else None
         )
+        if query_vec is not None and descent_margin > 0.0:
+            qs_results = self._db._search_rules(self._grammar, rule, query_vec, top_k=1)
+            if qs_results:
+                parent_score = qs_results[0].score
 
         result = chosen_text
         walk_ids: list[str] = [chosen_id] if chosen_id else []
@@ -301,6 +339,14 @@ class Generator:
                 if child_pick is not None and child_pick[2] is not None
                 else None
             )
+            # Override with raw-query-anchored score when caller supplied
+            # ``query_vec`` (apples-to-apples — see parent_score comment).
+            if query_vec is not None and descent_margin > 0.0:
+                cs_results = self._db._search_rules(
+                    self._grammar, ref, query_vec, top_k=1
+                )
+                if cs_results:
+                    child_score = cs_results[0].score
 
             # Walk-stop guard: only fires when both parent + child have real
             # scores AND the child underperforms the parent enough that the
@@ -352,6 +398,7 @@ class Generator:
                     no_match_text,
                     descent_margin,
                     confidence_gap,
+                    query_vec,
                     depth + 1,
                     visit_stack=visit_stack,
                 )
@@ -367,6 +414,7 @@ class Generator:
                     no_match_text,
                     descent_margin,
                     confidence_gap,
+                    query_vec,
                     depth + 1,
                     visit_stack=visit_stack,
                     preselected=child_pick,
