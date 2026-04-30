@@ -79,10 +79,62 @@ def fake_embedder():
     return FakeEmbedder()
 
 
+class TokenEmbedder:
+    """Deterministic token-overlap embedder for semantic-style tests.
+
+    Each unique token gets a stable random unit vector. A text's embedding is
+    the L2-normalized sum of its token vectors. Cosine similarity then
+    correlates with token overlap — a query like ``"parent topic about
+    something"`` cosines high against rules sharing those words. Lets walk-
+    stop tests assert real "parent matches better than child" semantics
+    without ML deps.
+    """
+
+    def __init__(self, dim: int = 64) -> None:
+        self._dim = dim
+        self._cache: dict[str, np.ndarray] = {}
+
+    def _token_vec(self, token: str) -> np.ndarray:
+        if token in self._cache:
+            return self._cache[token]
+        rng = np.random.default_rng(hash(token) % (2**31))
+        v = rng.standard_normal(self._dim).astype(np.float32)
+        v = v / (np.linalg.norm(v) + 1e-8)
+        self._cache[token] = v
+        return v
+
+    def _embed(self, text: str) -> list[float]:
+        tokens = [t for t in text.lower().split() if t]
+        if not tokens:
+            return [0.0] * self._dim
+        vec = np.zeros(self._dim, dtype=np.float32)
+        for t in tokens:
+            vec += self._token_vec(t)
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec = vec / norm
+        return vec.tolist()
+
+    async def create(self, input_data: str | list[str]) -> list[float]:
+        if isinstance(input_data, list):
+            input_data = " ".join(input_data)
+        return self._embed(input_data)
+
+    async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
+        return [self._embed(t) for t in input_data_list]
+
+
+@pytest.fixture
+def token_embedder() -> TokenEmbedder:
+    """Token-overlap embedder for walk-stop and other semantic-shape tests."""
+    return TokenEmbedder()
+
+
 @pytest.fixture
 def mem_db():
     """In-memory TrimTabDB for tests."""
     from trimtab.db import TrimTabDB
+
     return TrimTabDB(":memory:")
 
 
@@ -103,7 +155,9 @@ async def load_grammar_bulk(db, grammar_name, grammar, embedder):
     texts = [r.text for _, r in all_items]
     vectors = await embedder.create_batch(texts)
     for (symbol_name, rule_obj), vec in zip(all_items, vectors, strict=True):
-        db._put_rule_with_vector(grammar=grammar_name, symbol=symbol_name, rule=rule_obj, vector=vec)
+        db._put_rule_with_vector(
+            grammar=grammar_name, symbol=symbol_name, rule=rule_obj, vector=vec
+        )
 
 
 async def add_rule(db, grammar_name, symbol, text, embedder, id=None):
@@ -112,7 +166,9 @@ async def add_rule(db, grammar_name, symbol, text, embedder, id=None):
 
     vec = await embedder.create(text)
     rule = Rule(text=text, id=id or "")
-    return db._put_rule_with_vector(grammar=grammar_name, symbol=symbol, rule=rule, vector=vec)
+    return db._put_rule_with_vector(
+        grammar=grammar_name, symbol=symbol, rule=rule, vector=vec
+    )
 
 
 def list_rules_text_id(db, grammar_name, symbol):

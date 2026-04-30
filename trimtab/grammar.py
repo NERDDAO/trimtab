@@ -42,6 +42,15 @@ class Rule:
     Tracery calls these "rules"; the old trimtab code called them
     "expansions". Carries the text plus optional metadata, a stable id,
     and timestamps.
+
+    ``score`` is a transient, retrieval-time attribute populated by
+    ``Retriever.search`` (cosine similarity for ``CosineRetriever``,
+    fused RRF or cross-encoder score for ``HybridRetriever``). It is
+    **not** persisted to the DB and is ignored by all serialization
+    paths. ``None`` means "no score available" — callers (e.g. the
+    cascade Generator's walk-stop logic) should treat that as the
+    permissive case (always descend), preserving back-compat for
+    random-fallback selection paths.
     """
 
     text: str
@@ -49,6 +58,10 @@ class Rule:
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime | None = None  # filled in __post_init__
+    # Transient retrieval-time score. Not persisted; not part of equality
+    # contracts that pre-date this field — callers that compare Rule objects
+    # by value should compare on .id / .text, not on the whole dataclass.
+    score: float | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if not self.id:

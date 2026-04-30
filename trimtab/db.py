@@ -54,6 +54,7 @@ class TrimTabDB:
         # created an empty Symbol table, the detector would skip migration
         # entirely on real v0.4 DBs. Order: migrate → init_schema → probe.
         from trimtab.migrations import run_migration
+
         try:
             run_migration(self._conn)
         except Exception as e:
@@ -141,6 +142,7 @@ class TrimTabDB:
             return
         if self._embedding_dim is not None and self._embedding_dim != dim:
             from trimtab.errors import TrimTabDimensionError
+
             raise TrimTabDimensionError(expected=self._embedding_dim, got=dim)
 
         # First-ever creation (fresh DB with no migration, no prior put).
@@ -218,7 +220,8 @@ class TrimTabDB:
         # a Rule with no updated_at override; __post_init__ normally fills it
         # but defensive handling here too).
         updated_at_iso = (
-            rule.updated_at.isoformat() if rule.updated_at is not None
+            rule.updated_at.isoformat()
+            if rule.updated_at is not None
             else rule.created_at.isoformat()
         )
 
@@ -322,7 +325,9 @@ class TrimTabDB:
         merged_meta_str = "json:" + json.dumps(existing_meta)
 
         new_text = text if text is not None else existing_text
-        new_embedding_list = new_vector if new_vector is not None else list(existing_embedding)
+        new_embedding_list = (
+            new_vector if new_vector is not None else list(existing_embedding)
+        )
         now = datetime.now(timezone.utc).isoformat()
 
         # Delete-then-create (vector-indexed columns reject SET).
@@ -411,12 +416,17 @@ class TrimTabDB:
         Uses LadybugDB's HNSW index when available, falls back to a
         brute-force cosine scan if HNSW returns nothing (e.g., recently
         inserted rows that haven't been indexed yet).
+
+        Returned rules carry a transient ``score`` (cosine similarity,
+        i.e. ``1.0 - distance``) for downstream walk-stop / confidence
+        logic. The score is not persisted.
         """
         if self._embedding_dim is None:
             # No Rule table exists yet — nothing to search.
             return []
 
         rows: list[list] = []
+        used_brute_force = False
         try:
             result = self._conn.execute(
                 "CALL QUERY_VECTOR_INDEX('Rule', 'rule_embedding_idx', $vec, $k) "
@@ -430,12 +440,27 @@ class TrimTabDB:
             rows = []
 
         if not rows:
-            # Brute-force fallback over the (grammar, symbol) slice.
+            # Brute-force fallback over the (grammar, symbol) slice. The
+            # fallback already returns a 6-tuple with cosine distance in
+            # position 5 so the score-derivation below is uniform.
             rows = self._brute_force_search(grammar, symbol, query_vector, top_k)
+            used_brute_force = True
 
         rules: list[Rule] = []
         for row in rows[:top_k]:
-            rid, rtext, rmeta, rcreated, rupdated = row[0], row[1], row[2], row[3], row[4]
+            rid, rtext, rmeta, rcreated, rupdated = (
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+            )
+            distance = row[5] if len(row) > 5 else None
+            score: float | None = None
+            if distance is not None:
+                # LadybugDB cosine distance is in [0, 2]. Convert to a
+                # similarity in [-1, 1] for caller-side comparisons.
+                score = 1.0 - float(distance)
             # Strip the "json:" prefix that _put_rule_with_vector adds.
             meta = json.loads(rmeta[5:]) if rmeta else {}
             rules.append(
@@ -445,8 +470,10 @@ class TrimTabDB:
                     metadata=meta,
                     created_at=datetime.fromisoformat(rcreated),
                     updated_at=datetime.fromisoformat(rupdated),
+                    score=score,
                 )
             )
+        _ = used_brute_force  # reserved for future telemetry hook
         return rules
 
     def _brute_force_search(
@@ -455,8 +482,9 @@ class TrimTabDB:
         """Fallback cosine search when HNSW returns nothing.
 
         Returns rows shaped to match _search_rules's expected schema:
-        [id, text, metadata, created_at, updated_at] (distance is dropped
-        because the caller doesn't surface it).
+        ``[id, text, metadata, created_at, updated_at, distance]`` —
+        distance is in position 5 so the caller can derive ``score =
+        1.0 - distance`` uniformly for both HNSW and brute-force paths.
         """
         try:
             result = self._conn.execute(
@@ -477,7 +505,7 @@ class TrimTabDB:
             e_norm = e / (np.linalg.norm(e) + 1e-8)
             sim = float(np.dot(q_norm, e_norm))
             distance = 1.0 - sim
-            scored.append((distance, [rid, rtext, rmeta, rcreated, rupdated]))
+            scored.append((distance, [rid, rtext, rmeta, rcreated, rupdated, distance]))
         scored.sort(key=lambda x: x[0])
         return [row for _, row in scored[:top_k]]
 

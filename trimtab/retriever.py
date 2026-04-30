@@ -136,6 +136,8 @@ class CosineRetriever:
                 ]
 
         # No auxiliary signal — dense ranking (filtered by subset) is the answer.
+        # ``rules_by_id`` already carries the dense cosine score on each rule
+        # from ``_search_rules``; no rewrite needed here.
         if not has_aux:
             return [rules_by_id[i] for i in dense_ids[:top_k] if i in rules_by_id]
 
@@ -159,12 +161,16 @@ class CosineRetriever:
         fused = reciprocal_rank_fusion(all_rankings, k=self._rrf_k)
 
         out: list[Rule] = []
-        for rid, _score in fused:
+        for rid, fused_score in fused:
             rule = rules_by_id.get(rid)
             if rule is None:
                 # Aux id that's unknown to the DB — caller owns the validity
                 # contract; drop silently as the spec requires.
                 continue
+            # Overwrite the per-rule score with the fused RRF score so the
+            # generator's walk-stop logic compares apples-to-apples across
+            # the cascade (every level uses the same scoring family).
+            rule.score = fused_score
             out.append(rule)
             if len(out) >= top_k:
                 break
@@ -349,7 +355,8 @@ class HybridRetriever:
         state = self._state_for(db, grammar, symbol)
         if state is None:
             # Nothing under (grammar, symbol) or all-empty corpus — dense is
-            # the authoritative answer.
+            # the authoritative answer (scores already populated by
+            # ``_search_rules``).
             return dense_rules[:top_k]
 
         query_tokens = _tokenize(query)
@@ -380,11 +387,15 @@ class HybridRetriever:
 
         dense_by_id = {r.id: r for r in dense_rules}
         # Hydrate fused rule ids into Rule objects, keeping fused order for now.
+        # Overwrite each rule's transient ``score`` with the fused RRF score so
+        # the cascade walk-stop logic can compare across cascade levels with
+        # one consistent scoring family.
         fused_rules: list[Rule] = []
-        for rid, _score in fused:
+        for rid, fused_score in fused:
             rule = dense_by_id.get(rid) or state.rules_by_id.get(rid)
             if rule is None:
                 continue
+            rule.score = fused_score
             fused_rules.append(rule)
             if len(fused_rules) >= self._rerank_pool:
                 break
@@ -409,10 +420,13 @@ class HybridRetriever:
             text_to_rule.setdefault(r.text, r)
         reranked: list[Rule] = []
         seen: set[str] = set()
-        for passage, _s in scored:
+        for passage, ce_score in scored:
             rule = text_to_rule.get(passage)
             if rule is None or rule.id in seen:
                 continue
+            # Cross-encoder score is now the authoritative final score for
+            # cascade-walk decisions when rerank is enabled.
+            rule.score = float(ce_score)
             seen.add(rule.id)
             reranked.append(rule)
             if len(reranked) >= top_k:
