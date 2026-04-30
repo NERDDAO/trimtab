@@ -264,20 +264,29 @@ class Generator:
 
         # Score for this symbol's chosen rule (used by the walk-stop check
         # before recursing into each child ref). When ``query_vec`` is
-        # supplied, walk-stop uses the BEST score at this symbol against
-        # the RAW query (apples-to-apples comparison across levels) rather
-        # than the chosen rule's context-anchored score. The cascade walk
-        # naturally inflates context-anchored scores at deeper symbols
-        # because ``cascaded_context`` grows with each chosen rule's text;
-        # using a fixed query anchor removes that bias and makes the
-        # "child must be more relevant than parent" semantic meaningful.
+        # supplied, score the CHOSEN rule against the raw query (not the
+        # cascaded context) — apples-to-apples across levels.
+        #
+        # Why not "best-at-symbol vs query"? Symbol cardinality grows down
+        # the cascade (13 taxonomies → hundreds of entities), so the BEST
+        # score is monotonically increasing with depth — walk-stop would
+        # never fire. Scoring the cascade's actual pick catches the case
+        # where the context-anchored selector forced a wrong leaf with
+        # poor query relevance.
         parent_score: float | None = (
             chosen_rule.score if chosen_rule is not None else None
         )
-        if query_vec is not None and descent_margin > 0.0:
-            qs_results = self._db._search_rules(self._grammar, rule, query_vec, top_k=1)
-            if qs_results:
-                parent_score = qs_results[0].score
+        if query_vec is not None and descent_margin > 0.0 and chosen_rule is not None:
+            # _search_rules returns top-K by query_vec cosine. Pull a wide
+            # net so the cascade's chosen rule is likely in the top-K;
+            # find it by id and use its score.
+            qs_results = self._db._search_rules(
+                self._grammar, rule, query_vec, top_k=50
+            )
+            for r in qs_results:
+                if r.id == chosen_rule.id:
+                    parent_score = r.score
+                    break
 
         result = chosen_text
         walk_ids: list[str] = [chosen_id] if chosen_id else []
@@ -339,14 +348,24 @@ class Generator:
                 if child_pick is not None and child_pick[2] is not None
                 else None
             )
-            # Override with raw-query-anchored score when caller supplied
-            # ``query_vec`` (apples-to-apples — see parent_score comment).
-            if query_vec is not None and descent_margin > 0.0:
+            # Override with raw-query-anchored score for the CHILD'S
+            # CHOSEN rule when caller supplied ``query_vec`` (see
+            # parent_score block for rationale). Top-K=50 to maximize
+            # the chance the chosen rule is in the query-anchored ranking.
+            if (
+                query_vec is not None
+                and descent_margin > 0.0
+                and child_pick is not None
+                and child_pick[2] is not None
+            ):
+                child_chosen_id = child_pick[2].id
                 cs_results = self._db._search_rules(
-                    self._grammar, ref, query_vec, top_k=1
+                    self._grammar, ref, query_vec, top_k=50
                 )
-                if cs_results:
-                    child_score = cs_results[0].score
+                for r in cs_results:
+                    if r.id == child_chosen_id:
+                        child_score = r.score
+                        break
 
             # Walk-stop guard: only fires when both parent + child have real
             # scores AND the child underperforms the parent enough that the
