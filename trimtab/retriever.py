@@ -362,7 +362,14 @@ class HybridRetriever:
         query_tokens = _tokenize(query)
         sparse_ids: list[str] = []
         if query_tokens:
-            scores = state.bm25.get_scores(query_tokens)
+            # BM25Okapi.get_scores is pure-Python+numpy CPU-bound — wrap in
+            # to_thread so it doesn't block the asyncio event loop. Without
+            # this, parallel TaskGroup lanes that need to compute BM25
+            # serialize on the GIL/main thread, costing ~3s of overhead
+            # per request when chunks/kg lanes contend for it.
+            import asyncio
+
+            scores = await asyncio.to_thread(state.bm25.get_scores, query_tokens)
             ranked_indices = np.argsort(-scores)[:candidate_k]
             sparse_ids = [
                 state.corpus_ids[i] for i in ranked_indices if scores[i] > 0.0
