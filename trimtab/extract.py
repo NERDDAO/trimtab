@@ -19,7 +19,11 @@ raises an ``ImportError`` with a concrete install hint.
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import Any, Protocol
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "fastino/gliner2-base-v1"
 DEFAULT_THRESHOLD = 0.5
@@ -111,6 +115,16 @@ class GLiNER2Extractor:
                 "Install with `pip install trimtab[entities]`."
             ) from e
         self._model = GLiNER2.from_pretrained(model_name)
+        device = _requested_device()
+        if device:
+            try:
+                self._model = self._model.to(device)
+                eval_model = getattr(self._model, "eval", None)
+                if callable(eval_model):
+                    eval_model()
+                logger.info("GLiNER2Extractor: model loaded on device=%s", device)
+            except Exception as exc:
+                logger.warning("GLiNER2Extractor: failed to move model to device=%s: %s", device, exc)
         self._default_labels = default_labels or DEFAULT_LABELS
 
     def extract(
@@ -168,7 +182,6 @@ class GLiNER2Extractor:
         for slot, parsed in zip(non_empty_indices, formatted, strict=True):
             out[slot] = parsed
         return out
-
     def classify_batch(
         self,
         texts: list[str],
@@ -257,3 +270,9 @@ class GLiNER2Extractor:
             if spans:
                 out[label] = spans
         return out
+
+
+def _requested_device() -> str:
+    """Return requested torch device, or empty string for library default."""
+    device = os.environ.get("BONFIRES_GLINER_DEVICE") or os.environ.get("GLINER_DEVICE") or ""
+    return device.strip()

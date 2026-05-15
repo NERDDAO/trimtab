@@ -40,11 +40,20 @@ class GenerationResult(NamedTuple):
     ``rules_used`` carries the full ``Rule`` objects walked during generation,
     in walk order. Rules selected via random fallback paths (no DB lookup)
     contribute nothing here.
+    ``query_anchored_candidates`` carries side-channel candidate rules per
+    symbol, ranked against the raw ``query_vec`` (when supplied to
+    ``generate``). Populated by the walk-stop check (which already computes
+    these for free), so consumers can run downstream MMR / dedupe over the
+    candidate pool without paying a second retriever round-trip.
     """
 
     text: str
     ids: list[str]
     rules_used: list[Rule]  # full Rule objects walked, in order
+    # symbol → top-K rules ranked against ``query_vec``. ``None`` when
+    # ``query_vec`` was not supplied or the walk-stop check did not run
+    # (caller treats as empty).
+    query_anchored_candidates: dict[str, list[Rule]] | None = None
 
 
 class Generator:
@@ -173,6 +182,12 @@ class Generator:
             fallbacks contribute an empty id for that level.
         """
         rng = random.Random(seed)
+        # Shared dict that ``_expand`` populates from its walk-stop
+        # ``_search_rules(query_vec, top_k=10)`` calls — once per symbol
+        # touched. Surfaced via ``GenerationResult`` so consumers can run
+        # downstream diversification (e.g. MMR) over the candidate pool
+        # without paying a second retriever round-trip.
+        query_anchored: dict[str, list[Rule]] = {}
         text, ids, rules_used = await self._expand(
             origin,
             context,
@@ -184,10 +199,16 @@ class Generator:
             descent_margin,
             confidence_gap,
             query_vec,
+            query_anchored,
             depth=0,
             visit_stack=[],
         )
-        return GenerationResult(text=text, ids=ids, rules_used=rules_used)
+        return GenerationResult(
+            text=text,
+            ids=ids,
+            rules_used=rules_used,
+            query_anchored_candidates=query_anchored or None,
+        )
 
     async def _expand(
         self,
@@ -201,6 +222,7 @@ class Generator:
         descent_margin: float,
         confidence_gap: float,
         query_vec: list[float] | None,
+        query_anchored: dict[str, list[Rule]],
         depth: int,
         visit_stack: list[str] | None = None,
         preselected: (
@@ -283,6 +305,10 @@ class Generator:
             qs_results = self._db._search_rules(
                 self._grammar, rule, query_vec, top_k=10
             )
+            # Side-channel: surface query-anchored top-K so consumers can
+            # diversify (e.g. MMR) without paying a second retriever call.
+            if qs_results:
+                query_anchored[rule] = qs_results
             for r in qs_results:
                 if r.id == chosen_rule.id:
                     parent_score = r.score
@@ -362,6 +388,8 @@ class Generator:
                 cs_results = self._db._search_rules(
                     self._grammar, ref, query_vec, top_k=10
                 )
+                if cs_results:
+                    query_anchored[ref] = cs_results
                 for r in cs_results:
                     if r.id == child_chosen_id:
                         child_score = r.score
@@ -418,6 +446,7 @@ class Generator:
                     descent_margin,
                     confidence_gap,
                     query_vec,
+                    query_anchored,
                     depth + 1,
                     visit_stack=visit_stack,
                 )
@@ -434,6 +463,7 @@ class Generator:
                     descent_margin,
                     confidence_gap,
                     query_vec,
+                    query_anchored,
                     depth + 1,
                     visit_stack=visit_stack,
                     preselected=child_pick,

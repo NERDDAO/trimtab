@@ -532,6 +532,43 @@ class TrimTabDB:
         except Exception:
             return 0
 
+    def _get_rule_embedding(
+        self, grammar: str, symbol: str, rule_id: str
+    ) -> list[float] | None:
+        """Return the stored embedding vector for one rule.
+
+        Single-row lookup keyed on ``(grammar, symbol, id)`` — returns
+        the FLOAT[] embedding column verbatim as a Python ``list[float]``
+        so downstream callers (e.g. delve's vector-fusion picker path)
+        can avoid a round-trip back through the embedder.
+
+        Returns ``None`` when:
+
+        * No rule with ``rule_id`` exists under ``(grammar, symbol)``.
+        * The Rule table hasn't been created yet (cold grammar).
+        * The query raises (e.g. dimension mismatch in stored row) —
+          callers degrade to on-the-fly re-embedding rather than fail.
+        """
+        try:
+            result = self._conn.execute(
+                "MATCH (r:Rule) "
+                "WHERE r.id = $id AND r.grammar = $g AND r.symbol = $s "
+                "RETURN r.embedding LIMIT 1",
+                {"id": rule_id, "g": grammar, "s": symbol},
+            )
+            rows = result.get_all()
+        except Exception:
+            return None
+        if not rows:
+            return None
+        emb = rows[0][0]
+        if emb is None:
+            return None
+        try:
+            return [float(x) for x in emb]
+        except (TypeError, ValueError):
+            return None
+
     def _summary_all(self) -> dict[str, list[dict[str, Any]]]:
         """One-roundtrip snapshot of every rule grouped by grammar.
 
